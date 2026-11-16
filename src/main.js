@@ -1472,6 +1472,26 @@ function registerIpc() {
       if (!env.sysimg || !env.sysimg.ok) {
         issues.push({ code: 'sysimg', severity: 'warn', title: t('系统镜像未就绪'), hint: t('需要先下载 Android 系统镜像（约 1.5GB）。'), fix: 'deploy' });
       }
+      // 机械硬盘：安卓数据 / 系统镜像放在 HDD 上时，模拟器会因为磁盘慢卡住 15 秒以上被自己的
+      // 卡死检测强制结束（看起来像显卡崩溃），冷启动也会慢好几倍（实测 402s vs NVMe 64s）。
+      {
+        const where = [
+          [t('安卓数据目录'), runtime.provisioner.paths().avdHome],
+          [t('系统镜像'), env.sysimg && env.sysimg.dir],
+        ].filter(([, d]) => d);
+        const onHdd = [];
+        for (const [label, dir] of where) {
+          // eslint-disable-next-line no-await-in-loop
+          if ((await doctor.diskMediaType(dir).catch(() => '')) === 'HDD') onHdd.push(`${label}（${dir}）`);
+        }
+        if (onHdd.length) {
+          issues.push({
+            code: 'hdd', severity: 'warn', title: t('安卓运行时放在机械硬盘上'),
+            hint: t('{items} 位于机械硬盘（HDD）。模拟器在机械硬盘上开机会慢好几倍，负载高时还会卡死被强制结束。建议在 设置 → 系统集成 里把「安卓数据目录」和「运行时数据目录」改到固态硬盘（SSD）。', { items: onHdd.join(t('、')) }),
+            fix: 'hdd',
+          });
+        }
+      }
       // 残留锁文件：会让下一次启动被判定为「AVD 已被占用」而 FATAL
       const avdHome = runtime.provisioner.paths().avdHome;
       let locked = false;

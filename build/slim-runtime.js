@@ -33,7 +33,10 @@ const SAFE = [
   ['emulator/lib64/vulkan/glslangValidator.exe', '着色器校验工具（运行时用不到，-7MB）'],
   ['emulator/lib64/vulkan/libvulkan_lvp.dll', 'lavapipe 软件 Vulkan 后备（有系统显卡驱动时用不到，-53MB）'],
   ['emulator/lib64/vulkan/lvp_icd.json', 'lavapipe 的 ICD 描述（-1KB）'],
-  ['emulator/lib64/vulkan/vk_swiftshader.dll', 'SwiftShader Vulkan（gles_angle 目录里有同款副本，-23MB）'],
+  // 不能删 emulator/lib64/vulkan/vk_swiftshader.dll：同目录的 vk_swiftshader_icd.json 用相对路径
+  // .\vk_swiftshader.dll 指向它，-gpu swangle / software 时模拟器把 Vulkan 加载器指到这份 ICD。
+  // 删了之后 gles_angle 里的同款副本并不会被找到，结果是 VK_ERROR_INCOMPATIBLE_DRIVER，
+  // swangle 开不了机、software 直接崩 —— 整条渲染降级链都断了（RTX 3060 机器上实测）。
   ['emulator/lib64/qt/translations', '模拟器界面的多语言包（只剩 38px 标题栏）'],
   // 注意：不能删 emulator-check.exe —— emulator -accel-check 靠它检测 AEHD/WHPX，
   // 缺了会判定"无硬件加速"退回 TCG 软件模拟（实测开机从 42s 变成 10 分钟+）。

@@ -1401,6 +1401,13 @@ class EmulatorEngine {
       // 软件渲染是兜底项，它已经是最慢/最稳的选择，没有更差的替代品可退
       if (/software|swiftshader|swangle/.test(gpu)) return;
       if ((this.settings.engine.gpuMode || 'auto') !== 'auto') return;
+      // 模拟器的卡死检测（主循环 / vCPU 15 秒无响应）也会以 0xC0000005 退出，但那是磁盘慢 /
+      // 主机过载，不是这个渲染后端的问题：记成 badGpu 只会让下次换到更慢的软件渲染。
+      const recent = this._log.slice(-120).map((x) => x.line).join('\n');
+      if (/detected a hanging thread/i.test(recent)) {
+        this.log(`not marking gpu ${gpu} bad: the emulator hang detector fired (slow disk / overloaded host)`);
+        return;
+      }
       store.saveSettings({ engine: { badGpu: `${this._emuVersion || ''}|${gpu}` } });
     } catch (_) { /* ignore */ }
   }

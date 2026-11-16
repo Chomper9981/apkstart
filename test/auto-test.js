@@ -2513,6 +2513,35 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/launchInFlight = entry;/.test(mainJs), '要在 finally 里清空，避免卡死后续启动');
   });
 
+  await test('模拟器卡死检测（hanging thread）判为 HANG，不算渲染后端崩溃、不记 badGpu', () => {
+    const lines = [
+      'Selecting Vulkan device: NVIDIA GeForce RTX 3060',
+      "ERROR        | detected a hanging thread 'QEMU2 main loop'. No response for 15000 ms",
+      "ERROR        | detected a hanging thread 'QEMU2 CPU0 thread'. No response for 15000 ms",
+      'emulator exit 3221225477',
+    ];
+    assert(doctor.diagnose(lines).code === 'HANG', `卡死应判 HANG，实际 ${doctor.diagnose(lines).code}`);
+    assert(doctor.diagnose(['emulator exit 3221225477']).code === 'ACCESS_VIOLATION', '没有卡死记录时仍判渲染崩溃');
+
+    const { EmulatorEngine } = require('../src/core/emulator');
+    const store = require('../src/core/store');
+    store.saveSettings({ engine: { gpuMode: 'auto', badGpu: '' } });
+    const emu = new EmulatorEngine(path.join(__dirname, '..'));
+    emu._emuVersion = '37.3.9.0';
+    emu._log = lines.map((line, i) => ({ t: i, line }));
+    emu._noteGpuFailure({ gpu: 'host' });
+    assert(store.getSettings().engine.badGpu === '', '卡死导致的退出不能把 host 记成坏后端');
+    emu._log = [{ t: 1, line: 'emulator exit 3221225477' }];
+    emu._noteGpuFailure({ gpu: 'host' });
+    assert(store.getSettings().engine.badGpu === '37.3.9.0|host', '真正的渲染崩溃仍要记下');
+    store.saveSettings({ engine: { badGpu: '' } });
+  });
+
+  await test('瘦身脚本不能删 lib64/vulkan/vk_swiftshader.dll（同目录 ICD 用相对路径指向它）', () => {
+    const slim = fs.readFileSync(path.join(__dirname, '..', 'build', 'slim-runtime.js'), 'utf8');
+    assert(!/\['emulator\/lib64\/vulkan\/vk_swiftshader\.dll'/.test(slim), 'vk_swiftshader.dll 不能在删除清单里');
+  });
+
   console.log(results.join('\n'));
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) { /* ignore */ }

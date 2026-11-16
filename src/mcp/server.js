@@ -29,6 +29,7 @@ const INSTRUCTIONS = [
   'Typical loop: runtime_status → runtime_start (if needed) → install_apk / launch_app →',
   'ui_tree (find elements and their tap centers) → tap / type_text / swipe / press_key →',
   'wait_for to sync on the next screen → screenshot to look, logcat for errors.',
+  'For automated test runs call set_animations(enabled=false) first: animated screens make ui_tree time out.',
   'Prefer ui_tree + tap(text=…) over guessing coordinates from screenshots.',
   'Coordinates are device pixels (see runtime_status screen size).',
 ].join(' ');

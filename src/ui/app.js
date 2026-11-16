@@ -2087,6 +2087,11 @@ async function fixIssue(issue) {
       toast({ title: t('清理完成'), body: t('释放约 {mb} MB', { mb: ((r.saved || 0) / 1048576).toFixed(0) }), type: 'ok' });
       break;
     }
+    case 'hdd': {
+      toast({ title: t('建议改到固态硬盘'), body: t('在 设置 → 系统集成 里把「安卓数据目录」和「运行时数据目录」改到固态硬盘（SSD）上的文件夹。'), type: 'info', sticky: true });
+      openSettings();
+      break;
+    }
     case 'path': {
       toast({ title: t('建议改到纯英文目录'), body: t('在 设置 → 系统集成 里修改「运行时数据目录」，再重启软件。'), type: 'info', sticky: true });
       openSettings();

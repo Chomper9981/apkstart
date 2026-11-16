@@ -8,6 +8,7 @@
  *           using the runtime bundled with it. Default: node + the runtime in your ApkStart settings.
  *   --data  APPDATA to use (default: a fresh temp dir — first boot unpacks the system image, ~4 GB)
  *   --keep  leave the runtime running at the end
+ *   --stress N  afterwards loop N rounds of screenshot + ui_tree + scroll (the load that crashed -gpu host)
  *
  * Output: test/out/mcp-e2e/ (screenshots, ui tree, logcat).
  */
@@ -18,7 +19,7 @@ const path = require('path');
 
 const argv = process.argv.slice(2);
 const opt = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
-const apk = argv.find((a, i) => !a.startsWith('--') && !['--exe', '--data'].includes(argv[i - 1]));
+const apk = argv.find((a, i) => !a.startsWith('--') && !['--exe', '--data', '--stress'].includes(argv[i - 1]));
 if (!apk || !fs.existsSync(apk)) { console.error('usage: node test/mcp-e2e.js <app.apk> [--exe ApkStart.exe] [--data dir] [--keep]'); process.exit(2); }
 const exe = opt('--exe');
 const dataDir = opt('--data') || fs.mkdtempSync(path.join(os.tmpdir(), 'apkstart-mcp-e2e-'));
@@ -116,6 +117,28 @@ async function step(name, tool, args = {}, { timeout = 60000, check = () => true
   await step('screenshot (home)', 'screenshot', {}, {
     save: (r) => { const c = r.result && r.result.content && r.result.content[0]; if (c && c.data) fs.writeFileSync(path.join(OUT, 'home.png'), Buffer.from(c.data, 'base64')); },
   });
+  // --stress N: the load that used to crash the emulator (screen capture + UI dumps + input in a loop)
+  const rounds = Number(opt('--stress') || 0);
+  if (rounds > 0) {
+    await step('set_animations off', 'set_animations', { enabled: false });
+    await step('relaunch for stress', 'launch_app', { package: pkg }, { timeout: 120000 });
+    const t0 = Date.now();
+    let ok = 0;
+    for (let i = 1; i <= rounds; i++) {
+      const a = await rpc('tools/call', { name: 'screenshot', arguments: {} }, 60000).catch((e) => ({ error: e }));
+      const b = await rpc('tools/call', { name: 'ui_tree', arguments: {} }, 90000).catch((e) => ({ error: e }));
+      const c = await rpc('tools/call', { name: 'scroll', arguments: { direction: i % 2 ? 'down' : 'up' } }, 60000).catch((e) => ({ error: e }));
+      const bad = [a, b, c].find((r) => r.error || (r.result && r.result.isError));
+      if (bad) {
+        console.log(`✗ stress round ${i}/${rounds} failed after ${((Date.now() - t0) / 1000).toFixed(0)}s: ${(bad.error && bad.error.message) || textOf(bad).slice(0, 300)}`);
+        failed++;
+        break;
+      }
+      ok++;
+      if (i % 10 === 0) console.log(`  · stress ${i}/${rounds} ok (${((Date.now() - t0) / 1000).toFixed(0)}s)`);
+    }
+    if (ok === rounds) { passed++; console.log(`✓ stress ${rounds} rounds (${((Date.now() - t0) / 1000).toFixed(0)}s)`); }
+  }
   if (!argv.includes('--keep')) await step('runtime_stop', 'runtime_stop', {}, { timeout: 120000 });
 })().catch((e) => { failed++; console.error(`✗ ${e.message}`); }).finally(() => {
   if (nonJson) { failed++; console.log(`✗ stdout carried ${nonJson} non-JSON line(s)`); }

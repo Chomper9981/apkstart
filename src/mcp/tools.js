@@ -80,15 +80,22 @@ function createTools({ appRoot, log = () => {}, allowShell = false, runtime: inj
 
   async function dumpUi(c) {
     let last = '';
+    let timedOut = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
       // rm first: a failed dump must not hand back the previous screen
       // eslint-disable-next-line no-await-in-loop
-      last = await c.shell(`rm -f ${UI_DUMP}; uiautomator dump ${UI_DUMP} >/dev/null 2>&1; cat ${UI_DUMP} 2>/dev/null`, { timeout: 25000 }).catch((e) => String(e.message));
+      last = await c.shell(`rm -f ${UI_DUMP}; uiautomator dump ${UI_DUMP} >/dev/null 2>&1; cat ${UI_DUMP} 2>/dev/null`, { timeout: 25000 })
+        .catch((e) => { if (e.killed || /ETIMEDOUT|timed? ?out/i.test(String(e.message))) timedOut++; return ''; });
       if (last.includes('<hierarchy')) return ui.parseUiXml(last);
       // eslint-disable-next-line no-await-in-loop
       await sleep(500); // usually "null root node" while an animation is running
     }
-    throw fail('UI_DUMP_FAILED', `uiautomator could not dump the screen: ${clip(last, 300)}`);
+    // uiautomator waits for the UI to go idle before dumping; a screen that keeps animating
+    // (spinners, pulsing buttons) — especially with software rendering — never does.
+    const hint = timedOut
+      ? 'uiautomator timed out waiting for the screen to become idle (continuous animation?). Call set_animations with enabled=false and retry, or use screenshot.'
+      : `uiautomator returned no hierarchy${last ? `: ${clip(last, 200)}` : ''}. Retry in a moment, or use screenshot.`;
+    throw fail('UI_DUMP_FAILED', hint);
   }
 
   function selectorOf(a) {
@@ -437,6 +444,18 @@ function createTools({ appRoot, log = () => {}, allowShell = false, runtime: inj
           out = out.split(/\r?\n/).filter((l) => l.toLowerCase().includes(g)).join('\n');
         }
         return note + (clip(out.trim()) || '(no log lines)');
+      },
+    },
+    {
+      name: 'set_animations',
+      description: 'Turn Android system animations off (recommended for automated testing: faster, and ui_tree / wait_for stop timing out on animated screens) or back on. Affects the whole runtime, including what the user sees in ApkStart.',
+      inputSchema: { type: 'object', required: ['enabled'], properties: { enabled: { type: 'boolean' } } },
+      handler: async (a) => {
+        const c = await device();
+        const v = a.enabled ? '1' : '0';
+        await c.shell(['window_animation_scale', 'transition_animation_scale', 'animator_duration_scale']
+          .map((k) => `settings put global ${k} ${v}`).join('; '));
+        return `animations ${a.enabled ? 'on' : 'off'}`;
       },
     },
     {

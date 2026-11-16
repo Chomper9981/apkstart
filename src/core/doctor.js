@@ -391,7 +391,43 @@ function imageIdentity(dir) {
   return p.split('/').slice(-3).join('/');
 }
 
+/**
+ * 某个路径所在物理盘的介质类型：'HDD' | 'SSD' | ''（未知 / 非 Windows / 查询失败）。
+ * 安卓运行时对随机 I/O 极其敏感：AVD 或系统镜像放在机械硬盘上，模拟器主循环会卡住
+ * 超过 15 秒被它自己的卡死检测杀掉（退出码 0xC0000005，看起来像显卡崩溃）。
+ * 结果按盘符缓存，进程内只查一次（PowerShell 冷启动约 0.5~1s）。
+ */
+const _mediaCache = new Map();
+function diskMediaType(p) {
+  if (process.platform !== 'win32') return Promise.resolve('');
+  const m = /^([A-Za-z]):/.exec(path.resolve(String(p || '')));
+  if (!m) return Promise.resolve('');
+  const letter = m[1].toUpperCase();
+  if (_mediaCache.has(letter)) return _mediaCache.get(letter);
+  const ps = `$n=(Get-Partition -DriveLetter ${letter} -ErrorAction Stop | Get-Disk).Number;`
+    + ' (Get-PhysicalDisk | Where-Object { $_.DeviceId -eq "$n" }).MediaType';
+  const job = new Promise((resolve) => {
+    require('child_process').execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { windowsHide: true, timeout: 15000 }, (err, out) => {
+        const v = String(out || '').trim().toUpperCase();
+        resolve(err ? '' : (v === 'HDD' ? 'HDD' : (v === 'SSD' || v === 'SCM' ? 'SSD' : '')));
+      });
+  });
+  _mediaCache.set(letter, job);
+  return job;
+}
+
 const RULES = [
+  {
+    code: 'HANG',
+    // 模拟器自带的卡死检测：主循环 / vCPU 线程超过 15 秒没响应就主动自杀，退出码同样是
+    // 0xC0000005 —— 但根因不是显卡。实测（RTX 3060 + WHPX）：同一套参数，AVD 放在
+    // 机械硬盘上冷启动 402s、截屏+UI dump 压测时单轮 46s 后卡死；放在 NVMe 上 64s 开机、
+    // 60 轮压测全过。所以必须排在 ACCESS_VIOLATION 前面，免得把磁盘慢误记成「这个渲染后端坏了」。
+    re: /detected a hanging thread/i,
+    get title() { return t('运行时卡住超过 15 秒，被模拟器强制结束'); },
+    get hint() { return t('通常是磁盘太慢（安卓数据或系统镜像在机械硬盘上）或电脑负载过高，不是显卡问题。请把「安卓数据目录」和「运行时数据目录」改到固态硬盘（SSD），并关闭占用大量 CPU / 磁盘的程序后重试。'); },
+  },
   {
     code: 'ACCESS_VIOLATION',
     // Windows 上 emulator/qemu 以 0xC0000005（十进制 3221225477）退出：
@@ -576,5 +612,5 @@ module.exports = {
   versionNumbers, gpuCandidates, detectGpuVendor, chooseProfile, planVariants,
   overridesFromSettings, autoProfile,
   freePortPair, freeAdbPort, snapshotKey, imageIdentity,
-  diagnose, describeProfile, writeReport, vcRedistOk,
+  diagnose, describeProfile, writeReport, vcRedistOk, diskMediaType,
 };
