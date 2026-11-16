@@ -153,17 +153,17 @@ function renderGrid() {
           : `<div class="fallback" style="background:${esc(a.accent || '#9aa6b2')}">${esc(initialOf(a.label))}</div>`}
       </div>
       <div class="name">${esc(a.label)}</div>
-      <div class="meta">${a.running ? t('运行中') : `v${esc(a.versionName)}${a.lastLaunchAt ? ' · ' + relTime(a.lastLaunchAt) : ''}`}</div>
-      <div class="open-hint">${a.running ? t('切换到前台') : t('打开')}</div>
+      <div class="meta">${a.running ? esc(t('运行中')) : `v${esc(a.versionName)}${a.lastLaunchAt ? ' · ' + esc(relTime(a.lastLaunchAt)) : ''}`}</div>
+      <div class="open-hint">${esc(a.running ? t('切换到前台') : t('打开'))}</div>
     </div>
   `).join('') + `
-    <div class="card card-add" id="cardAdd" role="button" tabindex="0" title="${t('拖入 APK 文件，或点击选择')}">
+    <div class="card card-add" id="cardAdd" role="button" tabindex="0" title="${esc(t('拖入 APK 文件，或点击选择'))}">
       <div class="add-plus" aria-hidden="true">
         <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2"
              stroke-linecap="round"><path d="M12 6v12"/><path d="M6 12h12"/></svg>
       </div>
-      <div class="name">${t('添加应用')}</div>
-      <div class="meta">拖入 APK 即可安装</div>
+      <div class="name">${esc(t('添加应用'))}</div>
+      <div class="meta">${esc(t('拖入 APK 即可安装'))}</div>
     </div>
   `;
 }
@@ -481,18 +481,24 @@ async function markInstalled() {
 
 /* ---------------- 安装 ---------------- */
 
-/** 把安装失败翻译成「下一步该做什么」，只对最常见的几种做提示，其它原样显示 */
-function friendlyInstallErrorText(msg) {
+/**
+ * 把安装失败翻译成「下一步该做什么」，只对最常见的几种做提示，其它原样显示。
+ * 判断依据是主进程传来的稳定错误码（err.code），再退回到 message 里**不会被翻译**的原始标记
+ * （pm 的 INSTALL_FAILED_* / Node 的 ENOSPC…）。绝不匹配已翻译的中文/英文/越南文句子。
+ */
+function friendlyInstallErrorText(msg, code) {
   const s = String(msg || t('未知错误'));
-  if (/INSUFFICIENT_STORAGE|not enough (?:runtime )?(?:disk )?space|low disk space|空间不足|đủ dung lượng|ENOSPC/i.test(s)) {
+  const c = String(code || '');
+  const is = (re) => re.test(c) || re.test(s);
+  if (is(/INSUFFICIENT_STORAGE|DISK_FULL|ENOSPC/)) {
     return `${s}\n${t('安卓数据分区不够用：设置 → 性能与资源占用 → 安卓数据分区调大后点「立即扩容」。')}`;
   }
-  if (/NO_MATCHING_ABIS/i.test(s)) return `${s}\n${t('这个包只有 ARM 库，正在自动切换兼容镜像后重试。')}`;
-  if (/INSTALL_FAILED_ALREADY_EXISTS|signatures do not match/i.test(s)) {
+  if (is(/NO_MATCHING_ABIS/)) return `${s}\n${t('这个包只有 ARM 库，正在自动切换兼容镜像后重试。')}`;
+  if (is(/INSTALL_FAILED_ALREADY_EXISTS|INSTALL_FAILED_UPDATE_INCOMPATIBLE|INCONSISTENT_CERTIFICATES/) || /signatures do not match/i.test(s)) {
     return `${s}\n${t('同包名但签名不同（常见于从别的渠道装过）。在应用卡片右键「卸载」后再装。')}`;
   }
-  if (/INSTALL_FAILED_VERSION_DOWNGRADE/i.test(s)) return `${s}\n${t('已装版本更高，先在右键菜单里卸载再装。')}`;
-  if (/ERR_FS_FILE_TOO_LARGE|greater than possible Buffer|Cannot allocate|ENOMEM|out of memory/i.test(s)) {
+  if (is(/INSTALL_FAILED_VERSION_DOWNGRADE/)) return `${s}\n${t('已装版本更高，先在右键菜单里卸载再装。')}`;
+  if (is(/ERR_FS_FILE_TOO_LARGE|ENOMEM/) || /greater than possible Buffer|Cannot allocate|out of memory/i.test(s)) {
     return `${s}\n${t('这个安装包过大或内存不足，解析被系统拒绝了。请确认磁盘与内存充足后重试；仍失败请把安装包路径换成纯英文短路径（如 D:\\a.apk）。')}`;
   }
   return s;
@@ -1817,7 +1823,7 @@ function bindEvents() {
     const name = p && p.file ? String(p.file).split(/[\\/]/).pop() : '';
     toast({
       title: name ? t('安装失败：{name}', { name }) : t('安装失败'),
-      body: friendlyInstallErrorText((p && p.message) || t('未知错误')),
+      body: friendlyInstallErrorText((p && p.message) || t('未知错误'), p && p.code),
       type: 'error',
     });
   });
@@ -1930,14 +1936,15 @@ function renderWelcomeTips() {
   const apps = (state.apps || []).length;
   const tips = [];
   if (lastUpdate && lastUpdate.hasUpdate) {
-    tips.push(t('发现新版本 <b>{tag}</b>，可在「设置 → 软件更新」一键更新', { tag: esc(lastUpdate.tag || '') }));
+    // tHtml：模板里的 <b> 来自词典（可信），插值 {tag} 一律转义
+    tips.push(tHtml('发现新版本 <b>{tag}</b>，可在「设置 → 软件更新」一键更新', { tag: lastUpdate.tag || '' }));
   }
   if (!apps) {
-    tips.push(t('把 APK 拖进窗口就能安装，装完会自动生成桌面图标'));
+    tips.push(esc(t('把 APK 拖进窗口就能安装，装完会自动生成桌面图标')));
   } else {
-    tips.push(t('双击应用卡片即可在独立窗口中运行，右上角可旋转 / 缩放 / 关闭'));
+    tips.push(esc(t('双击应用卡片即可在独立窗口中运行，右上角可旋转 / 缩放 / 关闭')));
   }
-  tips.push(t('关窗口只是退出那个应用，安卓环境会留着，下次点开更快'));
+  tips.push(esc(t('关窗口只是退出那个应用，安卓环境会留着，下次点开更快')));
   box.innerHTML = tips
     .map((tip, i) => `<div class="welcome-tip"><i>${i + 1}</i><span>${tip}</span></div>`)
     .join('');

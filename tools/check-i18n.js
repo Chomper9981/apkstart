@@ -4,9 +4,15 @@
  * i18n coverage check.
  *
  *  1. Collects every translation key:
- *       - t('…') / t("…") / t(`…`) calls in src/**.js (key = literal, whitespace-collapsed)
+ *       - t('…') / tHtml('…') / N_('…') calls in src/**.js (key = literal, whitespace-collapsed;
+ *         N_ only marks a key whose t() call happens elsewhere)
  *       - static text, title/placeholder/alt/aria-label and [data-i18n-html] blocks in src/ui/*.html
- *  2. Reports keys missing from src/i18n/en.json and src/i18n/vi.json, and placeholder mismatches.
+ *  2. Reports, per language (en / vi):
+ *       - keys used in code but missing from the dictionary
+ *       - {placeholder} sets that differ between key and translation
+ *       - HTML tag sets that differ between key and translation (a translation must not add markup)
+ *       - empty translations
+ *     and across languages: keys present in one dictionary but not the other (en <-> vi parity).
  *  3. With --strays: lists CJK string literals NOT wrapped in t() (log-only strings are expected there).
  *  4. With --dump <file>: writes all keys (JSON array) for translators.
  *
@@ -94,7 +100,7 @@ function jsKeys(file, keys, strays) {
   const src = fs.readFileSync(file, 'utf8');
   const rel = path.relative(ROOT, file).replace(/\\/g, '/');
   // t() calls anywhere (also nested inside ${} of an outer template literal)
-  const re = /(?<![A-Za-z0-9_$.])t\(\s*(?:'((?:\\.|[^'\\\n])*)'|"((?:\\.|[^"\\\n])*)"|`([^`$]*)`)/g;
+  const re = /(?<![A-Za-z0-9_$.])(?:t|tHtml|N_)\(\s*(?:'((?:\\.|[^'\\\n])*)'|"((?:\\.|[^"\\\n])*)"|`([^`$]*)`)/g;
   for (const m of src.matchAll(re)) {
     const k = m[3] !== undefined ? m[3] : unescapeJs(m[1] !== undefined ? m[1] : m[2]);
     if (!CJK.test(k)) continue;
@@ -104,7 +110,7 @@ function jsKeys(file, keys, strays) {
   for (const s of lexStrings(src)) {
     if (!CJK.test(s.body)) continue;
     const before = src.slice(Math.max(0, s.start - 40), s.start);
-    const isT = /(?:^|[^A-Za-z0-9_$.])t\(\s*$/.test(before) || /\bi18n\.t\(\s*$/.test(before);
+    const isT = /(?:^|[^A-Za-z0-9_$.])(?:t|tHtml|N_)\(\s*$/.test(before) || /\bi18n\.(?:t|tHtml|N_)\(\s*$/.test(before);
     if (isT) {
       if (s.hasExpr) { strays.push(`${rel}:${s.line}: t() with \${} interpolation (use {name} placeholders): ${s.raw.slice(0, 80)}`); continue; }
       continue;
@@ -133,6 +139,26 @@ function htmlKeys(file, keys) {
 }
 
 function placeholders(s) { return [...String(s).matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort().join(','); }
+function tags(s) { return [...String(s).matchAll(/<\/?([a-zA-Z][\w-]*)/g)].map((m) => m[0].toLowerCase()).sort().join(','); }
+
+/** Static checks on the dictionaries themselves (also used by test/i18n-test.js). */
+function checkDicts(dicts) {
+  const problems = [];
+  const langs = Object.keys(dicts);
+  for (const lang of langs) {
+    const d = dicts[lang];
+    for (const [k, v] of Object.entries(d)) {
+      if (typeof v !== 'string' || !v.trim()) { problems.push(`[${lang}] empty translation: ${k.slice(0, 80)}`); continue; }
+      if (placeholders(k) !== placeholders(v)) problems.push(`[${lang}] placeholder mismatch: ${k.slice(0, 80)}  ->  ${v.slice(0, 80)}`);
+      if (tags(k) !== tags(v)) problems.push(`[${lang}] HTML tag mismatch: ${k.slice(0, 80)}  ->  ${v.slice(0, 80)}`);
+    }
+    for (const other of langs) {
+      if (other === lang) continue;
+      for (const k of Object.keys(d)) if (!(k in dicts[other])) problems.push(`[${other}] key present in ${lang} but missing here: ${k.slice(0, 80)}`);
+    }
+  }
+  return problems;
+}
 
 function main() {
   const args = process.argv.slice(2);
@@ -148,17 +174,21 @@ function main() {
     fs.writeFileSync(args[dumpAt + 1], JSON.stringify([...keys.keys()], null, 2));
   }
   let missing = 0;
+  const dicts = {};
   for (const lang of ['en', 'vi']) {
     const dict = JSON.parse(fs.readFileSync(path.join(SRC, 'i18n', `${lang}.json`), 'utf8'));
+    dicts[lang] = dict;
     const miss = [...keys.entries()].filter(([k]) => !(k in dict));
-    const bad = [...keys.keys()].filter((k) => k in dict && placeholders(k) !== placeholders(dict[k]));
     const unused = Object.keys(dict).filter((k) => !keys.has(k));
-    console.log(`[${lang}] keys=${keys.size} missing=${miss.length} placeholder-mismatch=${bad.length} unused=${unused.length}`);
+    console.log(`[${lang}] keys=${keys.size} missing=${miss.length} unused=${unused.length}`);
     for (const [k, where] of miss.slice(0, args.includes('--all') ? Infinity : 30)) console.log(`  missing: ${where}  ${k.slice(0, 100)}`);
-    for (const k of bad) console.log(`  placeholder mismatch: ${k.slice(0, 80)}  →  ${dict[k].slice(0, 80)}`);
     if (args.includes('--unused')) for (const k of unused) console.log(`  unused: ${k.slice(0, 100)}`);
-    missing += miss.length + bad.length;
+    missing += miss.length;
   }
+  const problems = checkDicts(dicts);
+  console.log(`dictionary problems=${problems.length}`);
+  for (const pr of problems) console.log(`  ${pr}`);
+  missing += problems.length;
   if (args.includes('--strays')) {
     console.log(`\nCJK string literals not wrapped in t() (${strays.length}):`);
     for (const s of strays) console.log('  ' + s);
@@ -167,4 +197,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { lexStrings, htmlKeys };
+module.exports = { lexStrings, htmlKeys, jsKeys, walk, checkDicts, placeholders, tags, SRC };

@@ -284,10 +284,12 @@ class Provisioner {
     const dir = targetDir || this.root;
     const free = doctor.freeDiskMB(dir);
     if (free && free < need + buf) {
-      throw new Error(
+      const err = new Error(
         `${t('目标磁盘空间不足：该组件约需 {need} MB，但「{dir}」所在盘仅剩 {free} MB。', { need: need + buf, dir, free })}\n`
         + t('建议：把「运行时数据目录」改到空间更大的盘（设置 → 系统集成 → 运行时数据目录 → 浏览），或先清理磁盘 / 卸载不用的应用后再试。'),
       );
+      err.code = 'DISK_FULL'; // 稳定错误码：调用方按它判断，不要匹配（已翻译的）message
+      throw err;
     }
     return free;
   }

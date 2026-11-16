@@ -86,7 +86,9 @@ async function getJson(url, timeout = 10000) {
   const res = await openUrl(url, { timeout });
   if (res.statusCode < 200 || res.statusCode >= 300) {
     res.resume();
-    throw new Error(`${new URL(url).host} ${res.statusCode}`);
+    const err = new Error(`${new URL(url).host} ${res.statusCode}`);
+    err.status = res.statusCode;
+    throw err;
   }
   const chunks = [];
   let len = 0;
@@ -317,12 +319,12 @@ class Sources {
             return { source: id, name: s.name, web: s.web, rel: this._syntheticRelease(id, tag), degraded: true };
           }
         } catch (_) { /* 兜底也不行 */ }
-        const limited = /\b(403|429)\b/.test(e.message);
+        const limited = e.status === 403 || e.status === 429;
         if (limited) this._blocked.set(id, Date.now() + this._blockMs);
         const hint = limited
           ? t('（被限流，已暂停使用该源一段时间）')
           : (id === 'gitee' && !token ? t('（可稍后重试，或在设置里填只读 token 提高额度）') : '');
-        return { source: id, name: s.name, web: s.web, error: `${e.message}${hint}` };
+        return { source: id, name: s.name, web: s.web, error: `${e.message}${hint}`, limited };
       }
     });
     return Promise.all(jobs);
@@ -342,7 +344,8 @@ class Sources {
     // 被限流的源记入熔断（放在这里而不是 fetchReleases 内部，是为了让「谁来提供
     // 结果」这件事可被替换/测试，同时保证任何入口拿到的 403 都会触发熔断）
     for (const x of all) {
-      if (x && x.error && /\b(403|429)\b/.test(x.error)) {
+      // limited 是结构化标记；也兼容外部注入的结果（只带 "host 403" 这种未翻译的状态码文本）
+      if (x && x.error && (x.limited || /\b(403|429)\b/.test(String(x.error)))) {
         this._blocked.set(x.source, Date.now() + this._blockMs);
       }
     }

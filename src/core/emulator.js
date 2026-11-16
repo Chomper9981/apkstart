@@ -17,7 +17,7 @@ const store = require('./store');
 const { Provisioner } = require('./provision');
 const doctor = require('./doctor');
 const userdata = require('./userdata');
-const { t } = require('../i18n');
+const { t, N_ } = require('../i18n');
 
 const AVD_NAME = 'apkstart';
 const SNAPSHOT_NAME = 'apkstart';
@@ -29,21 +29,25 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * 0xC0000005（3221225477）是崩溃里最常见的那个：访问冲突，实测多由
  * 显卡驱动 / Vulkan 后端在 guest 启动瞬间崩掉引起，换软件渲染即可绕过。
  */
-function describeExitCode(code) {
+function describeExitCode(code, { raw = false } = {}) {
   // 被信号结束时 code 是 null（Windows 上走 taskkill / adb emu kill 都会这样），
   // 不能当成 0 报「正常退出」，但也谈不上异常，返回空串让调用方原样显示。
   if (code == null) return '';
-  switch (Number(code)) {
-    case 0: return t('正常退出');
-    case 1: return t('启动参数或环境错误');
-    case 3221225477: return t('0xC0000005 访问冲突，渲染后端崩溃');
-    case 3221225725: return t('0xC00000FD 栈溢出');
-    case 3221225781: return t('0xC0000135 缺少 DLL（VC++ 运行库 / 运行时组件被杀毒删除）');
-    case 3221225506: return t('0xC0000022 拒绝访问（驱动或权限问题）');
-    case 3221225595: return t('0xC000007B 镜像位数不匹配或 DLL 损坏');
-    default: return '';
-  }
+  // raw：写进运行日志用的固定中文原文。日志会被 doctor.diagnose() 用正则分析，
+  // 不能随界面语言变化（英文译文里的 "error" / "snapshot" 之类词会误触发别的诊断规则）。
+  // N_() 只是给 tools/check-i18n.js 标记「这是要翻译的 key」，本身原样返回。
+  const s = EXIT_MEANINGS[Number(code)] || '';
+  return raw || !s ? s : t(s);
 }
+const EXIT_MEANINGS = {
+  0: N_('正常退出'),
+  1: N_('启动参数或环境错误'),
+  3221225477: N_('0xC0000005 访问冲突，渲染后端崩溃'),
+  3221225725: N_('0xC00000FD 栈溢出'),
+  3221225781: N_('0xC0000135 缺少 DLL（VC++ 运行库 / 运行时组件被杀毒删除）'),
+  3221225506: N_('0xC0000022 拒绝访问（驱动或权限问题）'),
+  3221225595: N_('0xC000007B 镜像位数不匹配或 DLL 损坏'),
+};
 
 class EmulatorEngine {
   constructor(appRoot) {
@@ -665,7 +669,7 @@ class EmulatorEngine {
     pipe(proc.stderr);
     proc.on('exit', (code) => {
       this.lastExitCode = code;
-      const meaning = describeExitCode(code);
+      const meaning = describeExitCode(code, { raw: true });
       this.log(`emulator exit ${code}${meaning ? `（${meaning}）` : ''}`);
       this._logWrite(logFile, `emulator exit ${code}${meaning ? `（${meaning}）` : ''}\n`);
       this.proc = null;
@@ -1038,15 +1042,16 @@ class EmulatorEngine {
     const needMB = 2500;
     if (avdFreeMB && avdFreeMB < needMB) {
       const msg = t('磁盘空间不足：安卓数据目录（{dir}）所在磁盘只剩 {free} GB，运行时至少要 {need} GB 可用。请在「设置 → 系统集成 → 安卓数据目录」把它改到空间充足的盘（例如 D:），或先清理磁盘。你的应用与存档不会被自动删除。', { dir: avdHome, free: (avdFreeMB / 1024).toFixed(1), need: (needMB / 1024).toFixed(1) });
-      this.log(msg);
+      // 日志（会被 doctor 分析）写固定英文标记，界面提示走 onLog / error
+      this.log(`disk check: not enough space for AVD (${avdHome}): free ${avdFreeMB}MB < ${needMB}MB`);
       onLog(msg);
-      return { ok: false, error: msg, needsSpace: true, attempts: [] };
+      return { ok: false, error: msg, needsSpace: true, code: 'DISK_FULL', attempts: [] };
     }
     if (diskMB && diskMB < 300) {
       const msg = t('运行时目录（{dir}）所在磁盘只剩 {free} GB，连日志和临时文件都写不下。请清理磁盘，或把「运行时数据目录」也换到别的盘。', { dir: loc.root, free: (diskMB / 1024).toFixed(1) });
-      this.log(msg);
+      this.log(`disk check: not enough space for runtime dir (${loc.root}): free ${diskMB}MB < 300MB`);
       onLog(msg);
-      return { ok: false, error: msg, needsSpace: true, attempts: [] };
+      return { ok: false, error: msg, needsSpace: true, code: 'DISK_FULL', attempts: [] };
     }
     const adbPort = await doctor.freeAdbPort(Number(process.env.ANDROID_ADB_SERVER_PORT) || 5044);
     // 让本进程里所有 adb 调用和 emulator 用同一个 server 端口

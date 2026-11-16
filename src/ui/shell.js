@@ -54,4 +54,6 @@ function applyState(s) {
 }
 
 api.shell.onState(applyState);
+// 切换界面语言时外壳不 reload（里面嵌着正在运行的安卓画面），就地刷新一次文字
+window.addEventListener('i18n:changed', () => { api.shell.state().then(applyState).catch(() => {}); });
 api.shell.state().then(applyState).catch(() => {});

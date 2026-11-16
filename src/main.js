@@ -746,7 +746,8 @@ async function runInstall(filePath) {
       : t('{label} 已安装', { label: result.app.label }));
     return result;
   } catch (e) {
-    send('install:error', { message: e.message, file: filePath });
+    // code 是稳定错误码（INSTALL_FAILED_* / DISK_FULL / NO_MATCHING_ABIS…），界面按它决定提示；message 只用于显示
+    send('install:error', { message: e.message, code: e.code || '', file: filePath });
     if (e.needsSetup) send('ui:navigate', 'setup');
     // 同一条错误 8 秒内只弹一次系统通知：连续重试时不会在右下角刷屏
     const now = Date.now();
@@ -1150,14 +1151,23 @@ function registerIpc() {
 
   ipcMain.handle('settings:get', () => store.getSettings());
   // 切换界面语言：保存 → 主进程立即换语言 → 托盘重建 → 所有窗口 reload（preload 会按新语言重新加载）
+  // 只换界面文字：不重启运行时、不动正在运行的安卓应用与其窗口。
+  //   - 主窗口 / 开机动画：reload（纯界面，状态都在主进程，reload 后重新拉取）；
+  //   - 应用窗口外壳（内嵌着模拟器画面）：不 reload，发 i18n:changed 就地重译标题栏。
   ipcMain.handle('settings:setLanguage', (_e, lang) => {
-    const code = i18n.normalize(lang);
+    const code = i18n.match(lang);
+    if (!code || !i18n.SUPPORTED.includes(String(lang).toLowerCase())) return { ok: false, reason: 'unsupported-language' };
     store.saveSettings({ language: code });
     i18n.setLang(code);
     try { if (trayRefresh) trayRefresh(); } catch (_) { /* ignore */ }
     try { if (tray) tray.setToolTip(t('ApkStart — 安卓应用运行器')); } catch (_) { /* ignore */ }
     for (const w of BrowserWindow.getAllWindows()) {
-      try { if (!w.isDestroyed()) w.webContents.reload(); } catch (_) { /* ignore */ }
+      try {
+        if (w.isDestroyed()) continue;
+        if (/shell\.html$/i.test(w.webContents.getURL())) w.webContents.send('i18n:changed', code);
+        else if (w === decodeWindow) continue;
+        else w.webContents.reload();
+      } catch (_) { /* ignore */ }
     }
     return { ok: true, language: code };
   });
@@ -1989,6 +1999,14 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     store.ensureDirs();
+    // 界面语言只决定一次并写回设置：老用户升级保持中文，新用户跟随系统语言。
+    // 之后托盘 / 通知 / 各窗口（preload）都读同一个值，重启后保持不变。
+    {
+      const saved = store.getSettings().language;
+      const r = i18n.resolveInitialLanguage({ saved, existingUser: store.existingUser, systemLocales: i18n.systemLocales() });
+      i18n.setLang(r.lang);
+      if (r.source !== 'saved') store.saveSettings({ language: r.lang });
+    }
     runtime = new Runtime(APP_ROOT);
     // 启动即留一行痕迹：出问题时用户把 app.log 发过来就能看到版本与数据目录
     appLog(`start v${app.getVersion()} data=${store.DATA_DIR} pid=${process.pid}`);

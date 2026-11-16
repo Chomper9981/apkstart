@@ -448,10 +448,14 @@ class AdbClient {
             err.code = 'NO_MATCHING_ABIS';
             throw err;
           }
-          throw new Error(friendlyInstallError(raw));
+          const err = new Error(friendlyInstallError(raw));
+          err.code = (/INSTALL_[A-Z_]+/.exec(raw) || [])[0] || 'INSTALL_UNKNOWN';
+          throw err;
         }
       }
-      throw new Error(t('拆分 APK 安装失败'));
+      const err = new Error(t('拆分 APK 安装失败'));
+      err.code = 'INSTALL_UNKNOWN';
+      throw err;
     } finally {
       staged.forEach((s) => unstage(s.staged ? s.path : null));
     }
