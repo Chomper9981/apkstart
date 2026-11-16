@@ -628,6 +628,9 @@ class EmulatorEngine {
 
   /** 拉起单个进程（不做开机等待，开机等待在 start() 的 probe 循环里） */
   spawnOnce(plan, { headless, onLog, logFile }) {
+    // 记住本次进程用的方案与「是否已开机成功」：开机后才崩的渲染后端也要记下来（见 exit 处理）
+    this._currentPlan = plan;
+    this._readyAt = 0;
     const loc = this.locate();
     const env = this.env(loc.root, plan);
     const args = this.buildArgs({
@@ -669,11 +672,21 @@ class EmulatorEngine {
     pipe(proc.stderr);
     proc.on('exit', (code) => {
       this.lastExitCode = code;
-      const meaning = describeExitCode(code, { raw: true });
-      this.log(`emulator exit ${code}${meaning ? `（${meaning}）` : ''}`);
-      this._logWrite(logFile, `emulator exit ${code}${meaning ? `（${meaning}）` : ''}\n`);
+      this.lastExitAt = Date.now();
+      // 日志（供 doctor 正则分析）用固定原文；界面提示用当前语言
+      const raw = describeExitCode(code, { raw: true });
+      this.log(`emulator exit ${code}${raw ? `（${raw}）` : ''}`);
+      this._logWrite(logFile, `emulator exit ${code}${raw ? `（${raw}）` : ''}\n`);
       this.proc = null;
+      const meaning = describeExitCode(code);
       onLog(meaning ? t('运行时已退出（code={code}，{meaning}）', { code, meaning }) : t('运行时已退出（code={code}）', { code }));
+      // 开机成功之后才因 0xC0000005（渲染后端访问冲突）崩掉：以前只有「拉起就崩」会被记进
+      // badGpu，这种「跑一会儿就崩」不记，下次 auto 仍选同一个后端、同样崩（实测 RTX 3060 +
+      // -gpu host 在装 APK 的负载下崩）。现在同样记下来，下次启动换下一个后端先试。
+      if (code === 3221225477 && this._readyAt && this._currentPlan === plan) {
+        this.log(`gpu ${plan.gpu} crashed ${Math.round((Date.now() - this._readyAt) / 1000)}s after boot; marking it bad for auto mode`);
+        this._noteGpuFailure(plan);
+      }
     });
     proc.on('error', (e) => {
       this.log(`spawn error: ${e.message}`);
@@ -1227,6 +1240,7 @@ class EmulatorEngine {
 
       if (ok) {
         const bootMs = Date.now() - started;
+        this._readyAt = Date.now();
         // 这一次真的起来了：清掉上次的失败记录，避免以后「诊断」翻出旧账
         this._clearFailure();
         // 一定要存 quickboot 快照：模拟器进程会随 ApkStart 退出而结束（Electron 的
