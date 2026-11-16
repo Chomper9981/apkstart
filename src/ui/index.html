@@ -201,7 +201,12 @@
         <div class="field">
           <label>本机自适应参数</label>
           <div class="inline-note" id="autoProfileText">正在检测…</div>
-          <span class="sub">内存、核心数、渲染后端、端口、加速方式全部自动选择；启动失败会自动降级重试，不需要手动改。</span>
+          <span class="sub" data-i18n-html>内存、核心数、渲染后端、端口、加速方式全部自动选择；启动失败会自动降级重试，不需要手动改。
+            ApkStart 用<b>专用 adb 服务端口 5044</b>（你系统里自己的 adb 是 5037），所以命令行里
+            <code>adb devices</code> 看不到这台安卓设备 —— 这是刻意的隔离。想连的话用
+            <code>$env:ANDROID_ADB_SERVER_PORT=5044</code> 再执行 adb。
+            注意：别对着 5555 端口手动 <code>adb connect</code>，那会在正在运行的应用上弹出
+            「允许 USB 调试吗」的系统弹窗。</span>
         </div>
         <div class="field">
           <label>磁盘总占用（运行时 + 安卓数据 + 缓存）</label>
@@ -253,12 +258,35 @@
         </div>
         <div class="field">
           <label>屏幕方向</label>
-          <select id="setLandscape">
-            <option value="portrait">竖屏（手机比例，适合刷短视频、看小说）</option>
-            <option value="landscape">横屏（宽屏铺满，适合看剧、玩游戏）</option>
+          <select id="setOrientationMode">
+            <option value="auto">跟随应用（推荐 · 自动选横竖屏，画面铺满不留黑边）</option>
+            <option value="portrait">强制竖屏（手机比例，适合刷短视频、看小说）</option>
+            <option value="landscape">强制横屏（宽屏铺满，适合看剧、玩游戏）</option>
           </select>
-          <span class="sub" data-i18n-html>横屏要改的是<b>虚拟手机的面板方向</b>，所以下次启动应用时会自动重启一次运行时
-            （约十几秒，只在那一次）。之后再启动都是直接用横屏面板，不再重启。</span>
+          <span class="sub" data-i18n-html>安卓的横竖屏是<b>虚拟手机面板的真实方向</b>决定的。面板方向和应用自己声明的方向不一致时，
+            安卓只会给应用中间一条窄画面、两侧补黑 —— 换窗口大小、改分辨率都填不满。
+            「跟随应用」会在安装 APK 时读出应用的方向，启动时自动把面板换成一致的那个，
+            所以红果、墨读这类应用会正立且铺满。方向不对时才重启一次运行时（约十几秒），
+            之后再打开同一方向的应用都是秒进。</span>
+        </div>
+        <div class="field">
+          <label>平板排版</label>
+          <select id="setTabletMode">
+            <option value="on">打开（推荐 · 逻辑密度 190dpi，sw606dp 走平板排版）</option>
+            <option value="off">关闭（镜像默认密度，手机排版）</option>
+          </select>
+          <span class="sub">720 宽按 190dpi 算等于 606dp，正好越过 Android 的 600dp 平板断点，
+            红果短剧的双列剧集页、设置页的分栏都只在这个排版下出现。关掉会回到手机排版
+            （字更大、信息更少）。切换后下次打开应用生效。</span>
+        </div>
+        <div class="field">
+          <label>当前面板方向</label>
+          <select id="setLandscape">
+            <option value="portrait">竖屏面板</option>
+            <option value="landscape">横屏面板</option>
+          </select>
+          <span class="sub" data-i18n-html>这是运行时<b>现在</b>用的物理面板方向，由上面那条策略自动写入。
+            只有在「强制」模式下它才完全由你决定。</span>
         </div>
         <div class="field">
           <label>窗口承载方式</label>

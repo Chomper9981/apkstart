@@ -116,6 +116,30 @@ function fileSize(p) {
 }
 
 /**
+ * 目录可写性探测（结果按目录缓存）。
+ *
+ * 为什么不用 fs.accessSync(dir, W_OK)：Windows 上它只看「只读」文件属性、
+ * 不看 ACL，对 C:\Program Files\WindowsApps\...（MSIX 安装目录）会给出错误的
+ * 「可写」结论，然后 .img.xz 展开到一半才失败。这里真的写一个探测文件再删掉。
+ */
+const _dirWritableCache = new Map();
+function provisionDirWritable(dir) {
+  if (_dirWritableCache.has(dir)) return _dirWritableCache.get(dir);
+  let ok = false;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.apkstart-wtest-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(probe, 'x');
+    fs.rmSync(probe, { force: true });
+    ok = true;
+  } catch (_) {
+    ok = false;
+  }
+  _dirWritableCache.set(dir, ok);
+  return ok;
+}
+
+/**
  * 下载完的完整性检查。不通过就**删掉这个不完整文件**。
  *
  * 以前这里只抛错、不删文件，于是 tmp 里永远留着一个半截 zip。下次进来
@@ -214,6 +238,15 @@ class Provisioner {
     const sysTag = DEFAULT_SYSIMG.tag;
     const sysApi = DEFAULT_SYSIMG.api;
     const sysAbi = DEFAULT_SYSIMG.abi;
+    // 运行时目录可写吗？
+    // 商店（MSIX）版把 emulator / platform-tools / system-images 直接放在安装包
+    // 里（C:\Program Files\WindowsApps\...），该目录是只读的：
+    //   - 就地展开 .img.xz、建 _tmp、建 qemu/ 都会失败；
+    //   - 但可执行文件从包里跑是允许的（而且这样才有包身份，%APPDATA% 虚拟化
+    //     视图才能和父进程一致）。
+    // 所以「能执行」和「可写」要分开：可执行路径继续指向包内，可写的数据
+    // （镜像展开目录 / AVD / 临时目录）全部改到用户数据目录。
+    const rootWritable = provisionDirWritable(root);
     // AVD（含用户数据、已装应用、quickboot 快照）必须落在可写且不会被清理的地方。
     // 单文件发行版的运行时是随包解压到临时目录的，把 AVD 放进去等于每次退出都丢应用。
     // 只要运行时目录不在 %APPDATA% 里，就把 AVD 固定指到用户数据目录。
@@ -236,9 +269,16 @@ class Provisioner {
     //  2) 老用户/单文件发行版把镜像放在用户数据目录 → 用那里的；
     //  3) 全新安装（两处都没有）→ 落在运行时目录，因为用户数据目录可能是被
     //     重定向过的临时目录（CI 组装运行时就是这种情况，写歪会直接校验失败）。
-    const sysRoot = fs.existsSync(rootImg) ? rootImg : (fs.existsSync(dataImg) ? dataImg : rootImg);
+    //  4) 运行时目录只读（MSIX 包内）→ 必须落到用户数据目录，否则 .img.xz 展不开。
+    let sysRoot;
+    if (!rootWritable) sysRoot = dataImg;
+    else if (fs.existsSync(rootImg)) sysRoot = rootImg;
+    else if (fs.existsSync(dataImg)) sysRoot = dataImg;
+    else sysRoot = rootImg;
     return {
       root,
+      // 只有可写时才把临时目录/辅助目录放在 root 下，否则一律改用数据目录
+      writeRoot: rootWritable ? root : path.join(store.DATA_DIR, 'runtime'),
       qemuDir: path.join(root, 'qemu'),
       qemuExe: path.join(root, 'qemu', 'qemu-system-x86_64.exe'),
       qemuImg: path.join(root, 'qemu', 'qemu-img.exe'),
@@ -250,11 +290,12 @@ class Provisioner {
       sysImgRoot: sysRoot,
       sysImgDir: path.join(sysRoot, `android-${sysApi}`, sysTag, sysAbi),
       avdHome: insideData ? path.join(root, 'avd') : writable,
-      aehdDir: path.join(root, 'aehd'),
-      imagesDir: path.join(root, 'images'),
+      aehdDir: path.join(rootWritable ? root : path.join(store.DATA_DIR, 'runtime'), 'aehd'),
+      imagesDir: path.join(rootWritable ? root : path.join(store.DATA_DIR, 'runtime'), 'images'),
       iso: path.join(root, 'images', 'android-x86.iso'),
       disk: path.join(root, 'images', 'android.qcow2'),
-      tmp: path.join(root, '_tmp'),
+      tmp: path.join(rootWritable ? root : path.join(store.DATA_DIR, 'runtime'), '_tmp'),
+      rootWritable,
       sysTag, sysApi, sysAbi,
     };
   }
@@ -262,7 +303,10 @@ class Provisioner {
   ensureDirs() {
     const p = this.paths();
     for (const d of [p.root, p.qemuDir, p.adbDir, p.imagesDir, p.tmp, p.avdHome]) {
-      fs.mkdirSync(d, { recursive: true });
+      // 逐个容错：商店（MSIX）版的 p.root 在只读的安装包里，建不出来也正常，
+      // 可写目录已经全部改道到用户数据目录（见 paths()）。一个建不出来不该
+      // 让整条启动路径抛错。
+      try { fs.mkdirSync(d, { recursive: true }); } catch (_) { /* 只读/被占用都跳过 */ }
     }
     return p;
   }
@@ -398,9 +442,13 @@ class Provisioner {
 
     // 完整版（内置运行时）只带一份 API 34 Google Play 镜像，它同时是主镜像与兼容镜像；
     // 不再依赖 compatImage 开关，避免「镜像明明在，却因为没勾开关而判定未部署」
-    const compatReady = this.playImageInfo().ok;
+    const playImage = this.playImageInfo();
+    const compatReady = playImage.ok;
     const emulatorReady = emulator.ok && (sysimg.ok || compatReady);
     const qemuReady = qemu.ok && diskSize > MIN_SIZE.disk;
+    // 包内带来的是 .xz/.gz：镜像「在」，只是还没展开。上层据此判断
+    // 「要不要联网下载」—— 有镜像就绝不下载，只展开。
+    const needsExtract = !!(sysimg.compressed || (compatReady && playImage.compressed));
 
     return {
       adb: { ...adb, required: true },
@@ -408,14 +456,19 @@ class Provisioner {
       sysimg: {
         ok: sysimg.ok || compatReady,
         dir: sysimg.dir,
-        size: sysimg.ok ? sysimg.size : (compatReady ? this.playImageInfo().size : 0),
+        size: sysimg.ok ? sysimg.size : (compatReady ? playImage.size : 0),
         api: sysimg.ok ? sysimg.api : (compatReady ? PLAY_SYSIMG.api : sysimg.api),
+        compressed: needsExtract,
         required: false,
         note: sysimg.ok
-          ? `Android ${sysimg.api} (${(sysimg.size / 1073741824).toFixed(2)} GB)`
-          : (compatReady ? t('Android {api}（ARM 兼容镜像）', { api: PLAY_SYSIMG.api }) : (sysimg.note || t('未下载'))),
+          ? `Android ${sysimg.api} (${(sysimg.size / 1073741824).toFixed(2)} GB${sysimg.compressed ? t('，包内压缩版，首次启动自动展开') : ''})`
+          : (compatReady
+            ? t('Android {api}（{kind}）', { api: PLAY_SYSIMG.api, kind: playImage.compressed ? t('包内压缩版，首次启动自动展开') : t('ARM 兼容镜像') })
+            : (sysimg.note || t('未下载'))),
       },
-      playImage: this.playImageInfo(),
+      // true = 镜像就在本地（包内），只需展开一次；上层据此**禁止**任何联网下载
+      needsExtract,
+      playImage,
       accel,
       qemu: { ...qemu, required: false },
       iso: {
@@ -840,7 +893,18 @@ class Provisioner {
     return done;
   }
 
-  /** 系统镜像是否完整（system.img 是硬指标，缺失或过小都视为没下完） */
+  /**
+   * 系统镜像是否完整。
+   *
+   * 「完整」有两种形态：
+   *   1. 已展开的 `system.img`（本地缓存 / 用户在设置里指定的运行时目录）；
+   *   2. **包内带来的 `system.img.xz` / `.gz`** —— 商店（MSIX）版和完整版安装包
+   *      都是这种形态，首次开机时由 materializeImages() 就地展开。
+   *
+   * 第 2 种必须算 ok，否则 checkEnv().ready 会是 false，autoDeploy 就会以为
+   * 「用户还没下镜像」，去网上拉一套 1.5GB 的 —— 这正是「明明装完带了镜像，
+   * 结果还在下载」的根因。返回值里的 compressed 标记表示「还需要展开一次」。
+   */
   systemImageInfo() {
     const p = this.paths();
     const roots = [p.sysImgRoot, path.join(this.root, 'system-images'), path.join(this.appRoot, 'engine', 'system-images')];
@@ -866,21 +930,34 @@ class Provisioner {
       }
     }
     let missing = null;
+    let packed = null;   // 只找到压缩包：还算「有」，但要展开
     for (const dir of candidates) {
-      const system = path.join(dir, 'system.img');
       const kernel = path.join(dir, 'kernel-ranchu');
-      const size = fileSize(system);
       const m = /system-images[\\/]android-(\d+)[\\/]([^\\/]+)[\\/]([^\\/]+)$/.exec(dir);
       const api = m ? Number(m[1]) : DEFAULT_SYSIMG.api;
       const tag = m ? m[2] : DEFAULT_SYSIMG.tag;
       const abi = m ? m[3] : DEFAULT_SYSIMG.abi;
+      // 已展开的优先
+      const size = fileSize(path.join(dir, 'system.img'));
       if (size > MIN_SIZE.sysimg && fs.existsSync(kernel)) {
-        return { ok: true, dir, size, api, tag, abi };
+        return { ok: true, dir, size, api, tag, abi, compressed: false };
+      }
+      // 再认压缩包（包内镜像的常态）
+      if (fs.existsSync(kernel)) {
+        for (const name of ['system.img.xz', 'system.img.gz']) {
+          const cs = fileSize(path.join(dir, name));
+          if (cs > MIN_SIZE.sysimg) {
+            if (!packed) packed = { ok: true, dir, size: cs, api, tag, abi, compressed: true, file: name };
+            break;
+          }
+        }
       }
       if (!missing && fs.existsSync(dir)) {
         missing = { ok: false, dir, size, api, tag, abi, note: size ? t('镜像不完整') : t('缺少 system.img') };
       }
     }
+    // 有压缩包就用它：需要展开，但**不缺镜像**，绝对不该触发联网下载
+    if (packed) return packed;
     if (missing) return missing;
     return { ok: false, dir: p.sysImgDir, size: 0, api: DEFAULT_SYSIMG.api, tag: DEFAULT_SYSIMG.tag, note: t('未下载') };
   }
@@ -1018,12 +1095,31 @@ class Provisioner {
   /** ARM 兼容镜像（Google Play 版）是否已就位 */
   playImageInfo() {
     const p = this.paths();
-    const dir = path.join(p.sysImgRoot, `android-${PLAY_SYSIMG.api}`, PLAY_SYSIMG.tag, PLAY_SYSIMG.abi);
-    const size = fileSize(path.join(dir, 'system.img'));
-    if (size > MIN_SIZE.sysimg && fs.existsSync(path.join(dir, 'kernel-ranchu'))) {
-      return { ok: true, dir, size, api: PLAY_SYSIMG.api, tag: PLAY_SYSIMG.tag };
+    const rel = `android-${PLAY_SYSIMG.api}/${PLAY_SYSIMG.tag}/${PLAY_SYSIMG.abi}`;
+    // 两个位置都看：展开目标（可写的数据目录）与包内原始位置。
+    // 商店/完整版安装包里带的是 system.img.xz，第一次开机才展开 —— 这里必须
+    // 认它，否则 installSystemImage / autoDeploy 会去网上重下一套。
+    const dirs = [path.join(p.sysImgRoot, rel), path.join(this.root, 'system-images', rel)];
+    let packed = null;
+    for (const dir of dirs) {
+      if (!fs.existsSync(path.join(dir, 'kernel-ranchu'))) continue;
+      const size = fileSize(path.join(dir, 'system.img'));
+      if (size > MIN_SIZE.sysimg) {
+        return { ok: true, dir, size, api: PLAY_SYSIMG.api, tag: PLAY_SYSIMG.tag, compressed: false };
+      }
+      if (!packed) {
+        for (const name of ['system.img.xz', 'system.img.gz']) {
+          const cs = fileSize(path.join(dir, name));
+          if (cs > MIN_SIZE.sysimg) {
+            packed = { ok: true, dir, size: cs, api: PLAY_SYSIMG.api, tag: PLAY_SYSIMG.tag, compressed: true, file: name };
+            break;
+          }
+        }
+      }
     }
-    return { ok: false, dir, size, note: size ? t('镜像不完整') : t('未下载') };
+    if (packed) return packed;
+    const size = fileSize(path.join(dirs[0], 'system.img'));
+    return { ok: false, dir: dirs[0], size, note: size ? t('镜像不完整') : t('未下载') };
   }
 
   /** 解析 Google Play 版镜像地址（<url> 相对索引文件所在目录） */

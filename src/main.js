@@ -29,6 +29,15 @@ function loadBrandIcon(size) {
   } catch (_) { /* 落到程序化图标 */ }
   return nativeImage.createFromBuffer(drawAppIcon(size || 256));
 }
+
+// 托盘用「小尺寸简化标」：把 512 主标缩到 16px 会糊成一团，纹理和文字都没了
+function loadTrayIcon() {
+  try {
+    const p = path.join(LOGO_DIR, 'tray-16.png');
+    if (fs.existsSync(p)) return nativeImage.createFromPath(p);
+  } catch (_) { /* 回退到程序化图标 */ }
+  return nativeImage.createFromBuffer(drawAppIcon(16));
+}
 const assoc = require('./core/assoc');
 const windowctl = require('./core/windowctl');
 const display = require('./core/display');
@@ -99,6 +108,16 @@ process.on('unhandledRejection', (e) => appLog(`REJECT ${e && (e.stack || e.mess
  * 首次启动（settings.json 尚不存在）时直接把 runtime.dir 指向它并开启兼容模式，
  * 用户无需任何下载与设置，开箱即用。之后用户仍可在设置里改回在线版。
  */
+/**
+ * 随安装包带来的运行时目录（完整版 exe 旁边的 runtime/、微软商店 MSIX 的
+ * app\resources\runtime）。非空 = 模拟器和镜像都是本地的：开机动画不该提
+ * 「下载」，autoDeploy 也不该联网。
+ *
+ * 必须在 bootstrapBundledRuntime() 之前声明：那个函数在模块加载时立刻执行，
+ * 用 `let` 声明在它后面会撞上 TDZ（赋值直接抛错，被 catch 吞掉，标志永远为空）。
+ */
+let bundledRuntimeDir = null;
+
 function bootstrapBundledRuntime() {
   try {
     const exeDir = path.dirname(process.execPath);
@@ -162,6 +181,8 @@ function bootstrapBundledRuntime() {
     }
     // 已有可用运行时（含在线版）就尊重它：AVD 用户数据就在该目录下，不能悄悄搬走
     if (currentOk) {
+      // 运行时就在 EXE 目录树里 = 它是安装包自带的（完整版 / 商店版）
+      bundledRuntimeDir = current;
       // 但仍把自动参数打开，旧配置里的硬编码 4G/4核/弃用 GPU 模式不能继续用
       if (s.engine.gpuMode === 'swiftshader_indirect' || s.engine.memoryMB === 4096) {
         store.saveSettings({ engine: { gpuMode: 'auto', autoMemory: true, memoryMB: 0, cores: 0 } });
@@ -182,6 +203,7 @@ function bootstrapBundledRuntime() {
       runtime: { dir: bundled, compatImage: playBundled },
       engine: { gpuMode: 'auto', autoMemory: true },
     });
+    bundledRuntimeDir = bundled;
   } catch (_) { /* 接管失败不阻塞启动，走在线引导 */ }
 }
 bootstrapBundledRuntime();
@@ -207,6 +229,22 @@ let androidSet = null;
 let updater = null;
 let updateBusy = false;
 let updateInfo = null;
+
+/**
+ * 开机动画窗口的状态放在模块级。
+ *
+ * 之前是写在 app.whenReady() 的回调里（const splashWin/splashDone），而
+ * runLaunch() / autoDeploy() 定义在更外层作用域 —— 它们里的
+ * `typeof splashDone === 'function'` 永远是 false，于是：
+ *   - 进度文字永远不更新（一直显示「正在准备…」）；
+ *   - 启动成功后 splash 永远不关闭，480x360 的 alwaysOnTop 窗口就钉在
+ *     屏幕中央、压在安卓画面上面。
+ * 这就是用户反馈的「打开应用出现多个窗口」：管理窗口/splash/应用窗口同时在场。
+ * 提升到模块级之后这些调用才真正生效。
+ */
+let splashWin = null;
+let splashProgress = () => {};
+let splashDone = () => {};
 
 // ---------------- 命令行解析 ----------------
 
@@ -266,6 +304,57 @@ function applyAutoStart() {
 // ---------------- 显示模式：全屏自适应 / 竖屏窗口可调 ----------------
 
 function displaySettings() { return store.getSettings().display || {}; }
+
+/**
+ * 这个应用应该用横屏面板还是竖屏面板？
+ *
+ * 模拟器的物理面板（hw.lcd）是画面的「真实形状」，Android 不会为了
+ * 一个跟面板方向不一致的应用去旋转整块面板 —— 它只会给应用一个信箱式的
+ * 中间窄条，两侧留黑。所以「铺满窗口」的唯一出路是：面板方向 = 应用方向。
+ *
+ * 优先级：设置里的强制模式 > 单个应用的手动覆盖 > APK 清单解析出的天然方向
+ * > 当前面板方向（应用声明跟随重力时不折腾重启）。
+ */
+function wantLandscapeFor(pkg) {
+  const ds = displaySettings();
+  const mode = ds.orientationMode || 'auto';
+  if (mode === 'landscape') return true;
+  if (mode === 'portrait') return false;
+  const app = pkg ? store.getApp(pkg) : null;
+  const override = app && app.orientationOverride;
+  if (override === 'landscape') return true;
+  if (override === 'portrait') return false;
+  const natural = app && app.orientation;
+  if (natural === 'landscape') return true;
+  if (natural === 'portrait') return false;
+  return !!ds.landscape;
+}
+
+/**
+ * 运行期「学习」应用真正的方向。
+ *
+ * 离线解析 AndroidManifest 对红果这类应用够用（几十个 Activity 写死 portrait），
+ * 但有的应用全部声明成 sensor / fullSensor，清单里看不出倾向。这种就等它真的
+ * 跑起来后问安卓自己要了一次（ActivityRecord 的 requestedOrientation 是系统
+ * 按应用实际请求算出来的最终值）。学到之后写进 apps.json，下次启动就能选对面板。
+ */
+async function learnAppOrientation(pkg) {
+  const app = store.getApp(pkg);
+  if (!app || app.orientation || app.orientationOverride) return null;
+  let out = '';
+  try {
+    out = await runtime.client().shell(
+      'dumpsys activity activities | grep -m1 requestedOrientation', { timeout: 8000 });
+  } catch (_) { return null; }
+  const s = String(out || '');
+  let value = null;
+  if (/requestedOrientation=SCREEN_ORIENTATION_(PORTRAIT|SENSOR_PORTRAIT|REVERSE_PORTRAIT|USER_PORTRAIT)/.test(s)) value = 'portrait';
+  else if (/requestedOrientation=SCREEN_ORIENTATION_(LANDSCAPE|SENSOR_LANDSCAPE|REVERSE_LANDSCAPE|USER_LANDSCAPE)/.test(s)) value = 'landscape';
+  if (!value) return null;
+  store.upsertApp({ package: pkg, orientation: value });
+  appLog(`learned orientation ${pkg} = ${value}`);
+  return value;
+}
 
 function screenRect() {
   const d = screen.getPrimaryDisplay();
@@ -403,11 +492,20 @@ async function openAppWindow(pkg, tip) {
     await runtime.endApp(currentAppPkg).catch(() => {});
   }
   const rec = store.getApp(pkg);
-  const land = !!displaySettings().landscape;
+  const land = wantLandscapeFor(pkg);
   const p0 = portraitSize();
+  const detached = displaySettings().windowEmbed === false;
+  // 面板方向和应用方向不一致 → beforeStart 会重启一次运行时（约 40 秒）。
+  const willRestart = land !== !!displaySettings().landscape;
+  // 独立窗口模式下壳窗口平时不显示，但**等待期间**必须给用户一个可见的交代：
+  //   - 有开机动画（首次启动）时由动画负责；
+  //   - 没有动画（切换应用）时必须把壳窗口显示出来，否则桌面上 40 秒什么都没有，
+  //     用户会以为程序崩了。
+  const splashVisible = !!(splashWin && !splashWin.isDestroyed());
+  const label = (rec && rec.label) || pkg;
   appWin.open({
     pkg,
-    label: (rec && rec.label) || pkg,
+    label,
     iconPath: rec && rec.icoPath,
     // 横屏时窗口按横比例开，否则竖窗口里塞横画面会留出大片黑边
     portrait: land ? { w: p0.h, h: p0.w } : p0,
@@ -415,14 +513,18 @@ async function openAppWindow(pkg, tip) {
     // 后者以前是个死开关（只在默认设置里声明，没有任何代码读它），这里补上。
     fullscreen: displaySettings().mode === 'fullscreen'
       || displaySettings().autoFullscreenOnLaunch === true,
-    detached: displaySettings().windowEmbed === false,
+    detached,
+    showWhileWaiting: detached && !splashVisible,
   });
   appWin.setIcon(rec && rec.icoPath);
   // 打开时按已保存的方向初始化（物理面板方向在 doctor.lcdFor 里决定）
   appWin.setState({
-    tip: tip || t('正在启动安卓运行时…'),
+    // 需要重启换面板时，直接把「为什么慢」写在提示里，别让用户对着 40 秒空屏猜
+    tip: willRestart
+      ? t('正在为《{label}》切换到{orient}（重启安卓环境，约 40 秒，只需一次）…', { label: String(label).slice(0, 20), orient: land ? t('横屏') : t('竖屏') })
+      : (tip || t('正在启动安卓运行时…')),
     ready: false,
-    landscape: !!displaySettings().landscape,
+    landscape: land,
   });
   currentAppPkg = pkg;
 }
@@ -433,13 +535,17 @@ async function toggleDisplayMode() {
   });
   const full = next.display.mode === 'fullscreen';
   if (appWin && appWin.isOpen) {
-    if (full) appWin.win.maximize();
+    // 独立窗口模式下画面在模拟器原生窗口里，maximize 壳窗口毫无视觉效果，
+    // 走 appWin.toggleMaximize 才会把模拟器窗口铺满/还原。
+    if (displaySettings().windowEmbed === false) {
+      appWin.toggleMaximize().catch(() => {});
+    } else if (full) appWin.win.maximize();
     else appWin.win.unmaximize();
     appWin.scheduleFit(6);
-    // 全屏 = 横屏：改物理面板并重启运行时，否则只是把竖画面拉大、右侧一大片空
-    if (!!displaySettings().landscape !== full) {
-      appWin.rotate(restartForOrientation).catch(() => {});
-    }
+    // 注意：这里**不再**顺手把面板方向也切了。
+    // 全屏和横屏是两件事：面板方向现在由「应用自己声明的方向」决定
+    // （见 wantLandscapeFor）。以前 F11 会连带重启运行时切横屏，结果竖屏应用
+    // 被塞进横屏面板 → 两侧黑边 → 用户以为「全屏没生效」。
   }
   return next.display.mode;
 }
@@ -468,6 +574,18 @@ async function autoDeploy({ force = false } = {}) {
   try {
     const env = await runtime.provisioner.checkEnv();
     const needEngine = !env.emulator.ok || !env.sysimg.ok;
+    // 随包自带运行时（完整版安装包 / 微软商店版）：**一律不联网**。
+    // 镜像已经在包里（压缩形态），第一次开机由 engine.ensure() 就地展开；
+    // 这里再下一套 1.5GB 纯属浪费，也正是用户抱怨的「装完还在下镜像」。
+    if (bundledRuntimeDir && env.adb.ok && env.emulator.ok && env.sysimg.ok) {
+      appLog(`autoDeploy 跳过：运行时随包内置（${bundledRuntimeDir}），无需联网`
+        + (env.needsExtract ? '，镜像将在首次启动时本地展开' : ''));
+      return { ok: true, source: 'bundled', needsExtract: !!env.needsExtract };
+    }
+    if (bundledRuntimeDir && !env.emulator.ok) {
+      appLog(`autoDeploy 跳过联网下载：运行时目录随包内置（${bundledRuntimeDir}），交给诊断流程`);
+      return { ok: false, error: 'bundled', bundled: true };
+    }
     // 轻量版优先用「本项目 GitHub 的运行时整包」：一个文件搞定 emulator + 系统镜像，
     // 下载源和更新源统一在 GitHub 上（国内比 dl.google.com 稳得多）。
     // 整包拿不到（没网 / 还没发过该资产 / 被限流）再逐个从官方源装。
@@ -550,8 +668,8 @@ function enableWindowsFeature(feature) {
 
 function createWindow({ show = true } = {}) {
   mainWindow = new BrowserWindow({
-    width: 1140,
-    height: 740,
+    width: Number(process.env.APKSTART_WIN_W) || 1140,
+    height: Number(process.env.APKSTART_WIN_H) || 740,
     minWidth: 900,
     minHeight: 560,
     show: false,
@@ -624,7 +742,7 @@ function send(channel, payload) {
 // ---------------- 托盘 ----------------
 
 function buildTray() {
-  const icon = loadBrandIcon(16);
+  const icon = loadTrayIcon();
   try {
     tray = new Tray(icon);
   } catch (_) {
@@ -770,6 +888,13 @@ async function runInstall(filePath) {
  */
 async function runUpdate() {
   if (updateBusy) return { ok: false, error: t('正在更新中') };
+  // 商店（MSIX）版不能自更新：安装目录 C:\Program Files\WindowsApps 是只读的，
+  // 覆盖 exe 不仅会失败，还可能让包完整性校验失效、应用直接起不来。
+  // 更新走 Microsoft Store（ms-windows-store: 协议）。
+  if (store.STORE_BUILD) {
+    shell.openExternal('ms-windows-store://downloadsandupdates').catch(() => {});
+    return { ok: false, error: t('商店版更新由 Microsoft Store 负责，已打开商店的「下载和更新」'), manual: true };
+  }
   updateBusy = true;
   const sendProgress = (p) => send('update:progress', p);
   try {
@@ -795,7 +920,38 @@ async function runUpdate() {
   }
 }
 
+/**
+ * 启动串行化。
+ *
+ * 一次启动最长要 80 秒（换面板重启 + 冷启动）。这期间用户完全可能再点一个应用、
+ * 或者双击同一个图标两次、或者托盘菜单里点一下 —— 以前这些都会真的并发跑第二遍：
+ * openAppWindow 会把正在启动的那个应用关掉（close + endApp），而虚拟机正在重启，
+ * 结果两边一起失败，日志里是 `cmd: Can't find service: activity` / `device not found`，
+ * 用户看到的是「点了没反应，然后弹回主界面」。
+ *
+ * 现在：同一个应用 → 直接复用进行中的那次（连点等于一次）；换应用 → 等前一次
+ * 收尾再开始，而不是把它的运行时抽走。
+ */
+let launchInFlight = null;
+
 async function runLaunch(pkg) {
+  if (launchInFlight) {
+    if (launchInFlight.pkg === pkg) {
+      appLog(`launch reused in-flight ${pkg}`);
+      return launchInFlight.promise;
+    }
+    appLog(`launch queued ${pkg}（等待 ${launchInFlight.pkg} 启动完成）`);
+    await launchInFlight.promise.catch(() => {});
+  }
+  const entry = { pkg };
+  entry.promise = launchOne(pkg).finally(() => {
+    if (launchInFlight === entry) launchInFlight = null;
+  });
+  launchInFlight = entry;
+  return entry.promise;
+}
+
+async function launchOne(pkg) {
   const t0 = Date.now();
   const mark = (s) => appLog(`launch ${pkg} ${s} +${Date.now() - t0}ms`);
   // 「提前接画面」的状态：进程一出现就接，但最终成败要等回调回来才知道。
@@ -804,13 +960,17 @@ async function runLaunch(pkg) {
   let earlyAttachOk = false;
   appLog(`launch start ${pkg}`);
   try {
-    // 1) 先把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
+    // 0) 先把管理窗口收起来，再去开应用窗口。
+    // 顺序很重要：以前是 openAppWindow() 之后、armAgent() 之后才 hide()，
+    // 而 armAgent 要等窗口代理冷启动（300~600ms），这段里「管理窗口 +
+    // 应用窗口(+ 开机动画)」是同时在屏幕上的 —— 用户看到的就是多个窗口乱飞。
+    if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
+    // 1) 再把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
     await openAppWindow(pkg, t('正在启动安卓运行时…'));
     // 开机阶段把模拟器主窗 + qemu / netsimd 的控制台黑窗藏起来，避免任何闪现。
     // 压制是常驻的（embed 后它会自动跳过被嵌入的那一个窗口，见 appwin.embed）。
     // 这里必须 await：不等压制生效就往下走，黑窗会在启动瞬间露出来。
     if (winAgent) { try { await armAgent(winAgent); } catch (_) { /* ignore */ } }
-    if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
 
     const r = await installer.launch(pkg, {
       onLog: (m) => {
@@ -827,13 +987,23 @@ async function runLaunch(pkg) {
         attachDoneEarly = true;
         mark('app up (提前接画面)');
         attachAppWindow()
-          .then((ok) => { earlyAttachOk = ok; mark(`early attach=${ok}`); })
+          .then((ok) => {
+            earlyAttachOk = ok;
+            mark(`early attach=${ok}`);
+            // 画面已接到用户眼前 → 开机动画可以淡出了。
+            // 放在这里而不是 launch ok 之后，是因为 early attach 时模拟器窗口
+            // 已经 show 出来了；如果等 launch ok（还要再等 4 秒存活确认），
+            // splash 和模拟器窗口会同时可见好几秒，用户看到 splash 被「顶上去」。
+            if (ok && typeof splashDone === 'function') splashDone();
+          })
           .catch(() => { earlyAttachOk = false; });
         // 应用刚起来时 Activity 还在重建，会按自己声明的方向（portrait）再转一次，
         // 把刚锁好的方向覆盖掉 —— 这就是「平板/横屏模式下画面总是 90 度躺着」。
         // 等它稳定后补一次方向自愈（读 init/cur，只有真躺倒才写）。
         setTimeout(() => {
           runtime._healOrientation?.().catch(() => {});
+          // 顺带记下这个应用真正的方向（清单里全是 sensor 的应用只能这样学）
+          learnAppOrientation(pkg).catch(() => {});
         }, 1800);
       },
       // 启动前先把面板方向校正到设置要求的那个。
@@ -843,7 +1013,10 @@ async function runLaunch(pkg) {
       // 所以这里发现不一致就先重启一次，reloadApp=false 让下面照常启动应用。
       beforeStart: async (rt) => {
         mark('engine ready');
-        const wantLand = !!displaySettings().landscape;
+        // 面板方向必须和应用自己的声明方向一致，否则 Android 只会给一个信箱式
+        // 窄条（两侧全黑）。wantLandscapeFor 会把「设置里的强制模式 / 单应用覆盖 /
+        // APK 清单解析出的方向」合起来算，见函数注释。
+        const wantLand = wantLandscapeFor(pkg);
         const cur = runtime.emulator && typeof runtime.emulator.panelLandscape === 'function'
           ? runtime.emulator.panelLandscape()
           : null;
@@ -935,7 +1108,7 @@ async function runLaunch(pkg) {
     }
     send('app:launched', { package: pkg, engine: r.engine });
     appLog(`launch ok ${pkg} ${attachMode}=${embedded}`);
-    // 安卓环境就绪 → 开机动画淡出
+    // 兜底：如果 early attach 没触发 splashDone（比如嵌入模式），这里补一次
     if (typeof splashDone === 'function') splashDone();
     return { ok: true, embedded };
   } catch (e) {
@@ -1650,6 +1823,17 @@ function registerIpc() {
       }
 
       // 没有 WHPX 组件：改用 AEHD 驱动（Google 自家，装完即用）
+      // 商店（MSIX）版不能走这条路：MSIX 不允许安装内核驱动，应用也不能以管理员
+      // 身份提权启动（包由 AppX 部署模型拉起，固定 mediumIL）。这里直接给出
+      // 可执行的指引，而不是弹一个注定失败的 UAC。
+      if (store.STORE_BUILD) {
+        return {
+          ok: false,
+          storeLimited: true,
+          accel,
+          note: t('微软商店版无法安装内核驱动。请到「启用或关闭 Windows 功能」里勾选「虚拟机平台（Virtual Machine Platform）」和「Windows 虚拟机监控程序平台」，重启电脑后 ApkStart 会自动使用 WHPX 硬件加速。'),
+        };
+      }
       const ae = await runtime.provisioner.installAehd(
         (x) => send('provision:progress', { ...x, component: 'aehd' }),
       ).catch((e) => ({ ok: false, error: e.message }));
@@ -1869,7 +2053,22 @@ function registerIpc() {
     if (appWin && appWin.isOpen) { appWin.close(); return { ok: true }; }
     return { ok: false };
   });
-  ipcMain.handle('shell:rotate', () => appWin.rotate(restartForOrientation));
+  // 标题栏的旋转按钮 = 「这个应用我要横着/竖着用」。
+  // 以前它只是把全局 landscape 翻一下，于是点红果的旋转按钮会把**所有**应用
+  // 都带到横屏面板上去，红果自己反而被信箱化。现在写成该应用自己的覆盖值，
+  // 别的应用不受影响（设置里的「强制」模式仍然优先）。
+  ipcMain.handle('shell:rotate', () => {
+    const pkg = appWin && appWin.pkg;
+    // 以「面板实际方向」为基准取反，而不是 appWin.state.landscape
+    //（后者是「期望方向」，在启动切换面板的过程中可能还没落地）。
+    const next = !displaySettings().landscape;
+    if (pkg) {
+      store.upsertApp({ package: pkg, orientationOverride: next ? 'landscape' : 'portrait' });
+      appLog(`orientation override ${pkg} = ${next ? 'landscape' : 'portrait'}`);
+    }
+    return appWin.rotate(restartForOrientation);
+  });
+
   ipcMain.handle('shell:back', async () => { await runtime.client().keyBack(); });
   ipcMain.handle('shell:forward', async () => { await runtime.client().keyForward(); });
 
@@ -2015,11 +2214,18 @@ if (!gotLock) {
     // 仿抖音 DSH 风格：Logo 渐显 + 进度条 + 状态文字。
     // 首次安装时额外显示配置步骤介绍；非首次只显示精简动画。
     // 安卓环境就绪后淡出关闭，应用秒进。
-    let splashWin = null;
     const isFirstRun = !store.getSettings().runtime.installed;
     try {
+      // 屏幕居中
+      const { screen: electronScreen } = require('electron');
+      const disp = electronScreen.getPrimaryDisplay();
+      const sw = disp.workAreaSize.width;
+      const sh = disp.workAreaSize.height;
+      const splashW = 480, splashH = 360;
       splashWin = new BrowserWindow({
-        width: 480, height: 360,
+        width: splashW, height: splashH,
+        x: Math.round((sw - splashW) / 2),
+        y: Math.round((sh - splashH) / 2),
         frame: false, transparent: false, resizable: false,
         alwaysOnTop: true, skipTaskbar: true,
         backgroundColor: '#0b0c0e',
@@ -2029,11 +2235,16 @@ if (!gotLock) {
           contextIsolation: true, nodeIntegration: false, sandbox: false,
         },
       });
+      // 用 screen-saver 级别确保不被模拟器窗口盖住（之前 alwaysOnTop 默认 level
+      // 和 agent 的 SetForegroundWindow 抢 z-order，导致 splash 被顶到后面）
+      splashWin.setAlwaysOnTop(true, 'screen-saver');
       splashWin.loadFile(path.join(__dirname, 'ui', 'splash.html'));
       splashWin.once('ready-to-show', () => splashWin.show());
       // IPC：版本号、首次运行标记、关闭
       ipcMain.handle('splash:version', () => app.getVersion());
       ipcMain.handle('splash:isFirstRun', () => isFirstRun);
+      // 组件是否随包自带：开机动画据此换文案，别对已经内置镜像的用户说「正在下载」
+      ipcMain.handle('splash:bundled', () => !!bundledRuntimeDir);
       ipcMain.on('splash:close', () => {
         if (splashWin && !splashWin.isDestroyed()) splashWin.close();
         splashWin = null;
@@ -2042,13 +2253,28 @@ if (!gotLock) {
       appLog(`splash window failed: ${e.message}`);
       splashWin = null;
     }
-    // 辅助函数：向 splash 推送进度 / 完成信号
-    const splashProgress = (p) => {
+    // 向 splash 推送进度 / 完成信号（模块级变量，见文件顶部说明）
+    splashProgress = (p) => {
       if (splashWin && !splashWin.isDestroyed()) splashWin.webContents.send('splash:progress', p);
     };
-    const splashDone = () => {
-      if (splashWin && !splashWin.isDestroyed()) splashWin.webContents.send('splash:done');
+    // 淡出信号只发一次；同时挂一个「保险丝」：splash 自己 2.5 秒内没关掉
+    // （渲染进程卡住 / IPC 丢失）就由主进程强关，绝不把启动画面留在桌面上。
+    let splashDoneSent = false;
+    splashDone = () => {
+      if (splashDoneSent) return;
+      splashDoneSent = true;
+      if (!splashWin || splashWin.isDestroyed()) return;
+      try { splashWin.webContents.send('splash:done'); } catch (_) { /* ignore */ }
+      setTimeout(() => {
+        try {
+          if (splashWin && !splashWin.isDestroyed()) splashWin.close();
+        } catch (_) { /* ignore */ }
+        splashWin = null;
+      }, 2500).unref?.();
     };
+    // 兜底超时：任何路径都没触发 splashDone（例如启动失败卡住）也要收掉，
+    // 否则 splash 会一直悬在屏幕中央 —— 这就是「多个窗口」最刺眼的一幕。
+    setTimeout(() => { if (!splashDoneSent) splashDone(); }, 180000).unref?.();
 
     const l = launcherInfo();
     installer = new Installer(runtime, {
@@ -2192,6 +2418,27 @@ if (!gotLock) {
     buildTray();
     applyAutoStart();
 
+    // 老版本安装的应用没有 orientation 字段（那时还没这个功能）。
+    // 不补的话「跟随应用」对它们只能退回「当前面板方向」，红果这类竖屏应用
+    // 在横屏面板下依旧是两侧黑边。这里用随包的离线 APK 清单解析补一次，
+    // 只读中央目录 + AndroidManifest，几百毫秒且只跑一次。
+    try {
+      const { parseApk } = require('./core/apk');
+      const filled = [];
+      for (const app of store.getApps()) {
+        if (app.orientation || !app.apkPath) continue;
+        if (!fs.existsSync(app.apkPath)) continue;
+        try {
+          const meta = parseApk(app.apkPath);
+          if (meta.orientation) {
+            store.upsertApp({ package: app.package, orientation: meta.orientation });
+            filled.push(`${app.label}=${meta.orientation}`);
+          }
+        } catch (_) { /* 解析失败的应用跳过，不影响启动 */ }
+      }
+      if (filled.length) appLog(`orientation backfill: ${filled.join(', ')}`);
+    } catch (_) { /* ignore */ }
+
     // 磁盘余量：小于 3GB 时安卓根本起不来（写镜像/快照都会失败）。
     // 与其让用户看着「打不开」不明所以，不如开门见山告诉他往哪儿改。
     {
@@ -2272,7 +2519,9 @@ if (!gotLock) {
 
     // 启动 8 秒后静默查一次新版本（打包后才有意义）。发现新版本只提示，
     // 绝不自动下载 —— 更新是用户点「立即更新」才做的事。
-    if (app.isPackaged) {
+    // 商店（MSIX）版跳过：安装目录是只读的 WindowsApps，自更新既写不进去也不
+    // 合规，更新统一由 Microsoft Store 负责。
+    if (app.isPackaged && !store.STORE_BUILD) {
       setTimeout(() => {
         updater.check().then((info) => {
           updateInfo = info;

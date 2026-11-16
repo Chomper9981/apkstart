@@ -1309,20 +1309,38 @@ class Runtime {
       await c.setOrientation(wantLand).catch(() => {});
       return;
     }
-    // 没躺倒 ≠ 状态就对。横屏平板模式依赖两个易丢的运行时状态：
-    //   - mSetIgnoreOrientationRequest=true（快照恢复 / framework 重启后经常回到 false）
-    //   - wm density 覆盖为 190（sw≥600dp 才走平板排版；同样会被 reset 掉）
-    // 这两项一旦丢失，横屏桌面就会退回手机形态 —— 正是「横屏不稳定」的表现。
+    // 没躺倒 ≠ 状态就对。平板排版依赖两个易丢的运行时状态：
+    //   - mSetIgnoreOrientationRequest（横屏时必须为 true，否则面板会被应用方向带歪）
+    //   - wm density 覆盖为 190（720 宽 → sw606dp ≥ 600dp 才走平板排版）
+    // 这两项一旦丢失，会退回手机形态 —— 正是「平板模式不稳定」的表现。
     // 这里做一次轻量校验，缺哪个补哪个（都是幂等命令，正常情况不写）。
+    const densityWanted = (this.settings.display || {}).tabletMode !== false ? 190 : null;
+    let ignoreOk = true;
     if (wantLand) {
       const win = await c.shell('dumpsys window | grep -oE "mSetIgnoreOrientationRequest=(true|false)"', { timeout: 8000 }).catch(() => '');
-      const ignoreOk = /mSetIgnoreOrientationRequest=true/.test(String(win));
+      ignoreOk = /mSetIgnoreOrientationRequest=true/.test(String(win));
+    }
+    let densityOk = true;
+    if (densityWanted) {
       const dens = await c.shell('wm density', { timeout: 6000 }).catch(() => '');
-      const densityOk = /Override density:\s*190/.test(String(dens));
-      if (!ignoreOk || !densityOk) {
-        this.log(`横屏状态收敛：ignore-orientation=${ignoreOk} density190=${densityOk} → 补齐`);
-        if (!ignoreOk) await c.shell('wm set-ignore-orientation-request true', { timeout: 8000 }).catch(() => {});
-        if (!densityOk) await c.shell('wm density 190', { timeout: 8000 }).catch(() => {});
+      // 「Override density: N」行存在且等于目标值才算对
+      const m = /Override density:\s*(\d+)/.exec(String(dens));
+      densityOk = !!m && Number(m[1]) === densityWanted;
+    }
+    if (!ignoreOk || !densityOk) {
+      this.log(`显示状态收敛：ignore-orientation=${ignoreOk} density=${densityOk} → 补齐`);
+      if (!ignoreOk) await c.shell('wm set-ignore-orientation-request true', { timeout: 8000 }).catch(() => {});
+      // density 只在**没有应用在前台**时才补。
+      // 改密度会触发配置变更 + Activity 重建，而缓存了 DisplayMetrics 的应用
+      // （墨读）会按旧密度重算一遍 dp，画面缩成左上角一小块、右边全是空白 ——
+      // 用户看到的就是「墨读没有填满窗口」。有应用在跑时留给下一次启动路径，
+      // installer.launch 的 resetDisplayOverrides 会在 am start 之前设好。
+      if (!densityOk) {
+        if (this._activeApps.size === 0) {
+          await c.shell(`wm density ${densityWanted}`, { timeout: 8000 }).catch(() => {});
+        } else {
+          this.log(`density=${densityWanted} 缺失但有应用在前台：跳过，等下次启动时设置（避免画面缩水）`);
+        }
       }
     }
   }

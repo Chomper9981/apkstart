@@ -272,6 +272,10 @@ class Installer {
       lastLaunchAt: existing ? existing.lastLaunchAt || 0 : 0,
       shortcutPath: existing ? existing.shortcutPath || null : null,
       bounds: existing ? existing.bounds || null : null,
+      // 应用天然的横竖屏（离线从 APK 清单算出来）：
+      // 决定模拟器物理面板用哪个方向，方向一致画面才能铺满窗口不留黑边。
+      // 用户手动设过 orientationOverride 时以用户的为准，这里只是「默认值」。
+      orientation: meta.orientation || (existing ? existing.orientation || null : null),
       pinned: existing ? !!existing.pinned : false,
     };
 
@@ -412,7 +416,11 @@ class Installer {
 
   async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {}, onAppUp = null } = {}) {
     const app = store.getApp(pkg);
-    const rt = await this.runtime.ensure({ onLog });
+    // 用 let：beforeStart 可能因为「面板方向和应用方向不一致」而重启运行时并
+    // 返回一个新的 rt（旧 client 已随 stop 失效）。以前这里是 const，一旦真的
+    // 走了重启分支就抛 "Assignment to constant variable."，把整个启动打断 ——
+    // 表现为「切横屏/竖屏后点应用直接失败」。
+    let rt = await this.runtime.ensure({ onLog });
     onMark('ensure done');
     if (!rt.ok) {
       const err = new Error(rt.error || t('运行时不可用'));

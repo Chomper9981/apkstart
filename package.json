@@ -1,7 +1,7 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "极致轻量的 Windows 安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行",
   "main": "src/main.js",
   "author": "RoutineMiku",
@@ -41,37 +41,16 @@
     "test:i18n-smoke": "node test/i18n-app-smoke.js",
     "pack": "node build/pack.js",
     "runtime": "node build/prepare-runtime.js",
-    "build:exe": "node build/prepare-runtime.js && electron-builder --win nsis",
+    "build:exe": "node build/prepare-runtime.js && electron-builder --win nsis --config electron-builder.yml",
+    "build:appx": "node build/prepare-runtime.js && electron-builder --win appx --x64 --config electron-builder.yml",
+    "build:msix": "node build/msix.js",
     "selftest": "node scripts/selftest.js",
     "assoc:on": "node scripts/assoc.js on",
     "assoc:off": "node scripts/assoc.js off",
     "test:boot": "node test/boot-test.js",
-    "pack:linux": "electron-builder --linux AppImage"
-  },
-  "build": {
-    "appId": "com.routinemiku.apkstart",
-    "productName": "ApkStart",
-    "directories": {
-      "output": "dist-linux"
-    },
-    "files": [
-      "src/**/*",
-      "assets/**/*",
-      "package.json",
-      "!src/ui/assets/*.jpg"
-    ],
-    "linux": {
-      "target": [
-        "AppImage"
-      ],
-      "category": "Utility",
-      "icon": "src/ui/assets/logo-128.png",
-      "desktop": {
-        "Name": "ApkStart",
-        "Comment": "在 FydeOS / Linux 上管理安卓应用",
-        "Categories": "Utility;"
-      }
-    }
+    "pack:linux": "electron-builder --linux AppImage --config electron-builder.yml",
+    "icons": "electron build/build-icons.js",
+    "shots": "electron build/store-shots.js"
   },
   "devDependencies": {
     "electron": "^33.4.11",

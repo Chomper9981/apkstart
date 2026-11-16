@@ -49,6 +49,49 @@ function pickIconFromZip(zip) {
 
 const IMG_RE = /\.(png|webp|jpe?g)$/i;
 
+// ---- 屏幕方向 ----
+// AndroidManifest 里 android:screenOrientation 是一个枚举整数：
+//   0 unspecified / 1 portrait / 2 landscape / 3 sensor / 4 sensorLandscape
+//   5 sensorPortrait / 6 reverseLandscape / 7 reversePortrait / 8 behind
+//   9 nosensor / 10 user / 11 fullSensor / 12 userLandscape / 13 userPortrait
+//   14 fullUser / 15 locked
+// 只有「明确钉死某一方向」的才计入统计；sensor / fullSensor / user / unspecified
+// 这些会跟随重力，必须由运行时的物理面板决定，统计时必须跳过，否则每个应用都会
+// 被算成「方向未定」。
+const ORI_PORTRAIT = new Set([1, 5, 7, 13]);
+const ORI_LANDSCAPE = new Set([2, 4, 6, 12]);
+
+/**
+ * 判断一个应用「天然」是竖屏还是横屏。
+ *
+ * 为什么需要它：模拟器的物理面板（hw.lcd）方向一旦和应用自己的
+ * screenOrientation 不一致，Android 只会给应用一个信箱式（letterbox）的
+ * 中间窄条 —— 两侧全是黑边，怎么调 wm size / density / letterbox-style 都
+ * 填不满（这套组合我们逐项试过，见 docs）。唯一能让画面铺满窗口的办法，
+ * 就是让面板方向和应用声明的一致。所以在安装时离线把方向算出来存进 apps.json，
+ * 启动时按它选面板，用户就不会看到黑边。
+ *
+ * 统计口径：以声明了明确方向的 Activity 数量为准（启动 Activity 加权，
+ * 因为它是用户最常看到的那一个）。红果这类「几十个 portrait + 一堆 sensor」
+ * 会得到 portrait；墨读这种单 Activity landscape 会得到 landscape。
+ *
+ * @returns {'portrait'|'landscape'|null} null = 声明为跟随重力，交给设置决定
+ */
+function detectOrientation(acts, launcher) {
+  let portrait = 0;
+  let landscape = 0;
+  for (const a of acts) {
+    const raw = attrValue(a, 'screenOrientation');
+    const v = typeof raw === 'number' ? raw : Number(raw);
+    const weight = a === launcher ? 4 : 1;
+    if (ORI_PORTRAIT.has(v)) portrait += weight;
+    else if (ORI_LANDSCAPE.has(v)) landscape += weight;
+  }
+  if (portrait === 0 && landscape === 0) return null;
+  if (portrait === landscape) return null;
+  return portrait > landscape ? 'portrait' : 'landscape';
+}
+
 /** 取节点上的 drawable / src 引用，还原成 APK 内的文件路径 */
 function drawableFileOf(node, res) {
   for (const name of ['drawable', 'src']) {
@@ -184,6 +227,9 @@ function parseApkZip(zip, filePath, stat) {
     }
   }
 
+  // ---- 屏幕方向（决定模拟器物理面板该用横屏还是竖屏，见 detectOrientation）----
+  const orientation = detectOrientation(acts, launcher);
+
   // ---- 图标 ----
   let icon = null;
   const iconAttr = attr(app, 'icon') || attr(app, 'roundIcon');
@@ -220,6 +266,7 @@ function parseApkZip(zip, filePath, stat) {
     targetSdk,
     launchActivity,
     abis,
+    orientation,
     iconPng: icon ? icon.data : null,
     iconFile: icon ? icon.file : null,
   };
@@ -238,4 +285,4 @@ function quickCheck(filePath) {
   }
 }
 
-module.exports = { parseApk, quickCheck };
+module.exports = { parseApk, quickCheck, detectOrientation };

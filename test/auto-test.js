@@ -515,7 +515,10 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     const j = adb.indexOf('async resetDisplayOverrides(');
     const body = adb.slice(i, j);
     assert(!/wm size \d/.test(body), 'setOrientation 不得再设置 wm size 覆盖');
-    assert(/wm density 190/.test(body), 'density 只作为退化路径保留');
+    // density 现在统一走 tabletDensity()（用户可在设置里关掉平板排版），
+    // 但常量本身必须仍是 190（720 宽 → 606dp 才越过平板断点）。
+    assert(/wm density \$\{tabletDensity\(\)\}/.test(body), 'density 只作为退化路径保留');
+    assert(/const TABLET_DENSITY = 190/.test(adb), '平板密度常量必须是 190');
   });
 
   await test('游戏模式必须使用高优先级且关闭全局鼠标钩子', () => {
@@ -924,7 +927,11 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/setWindowEmbed/.test(uiHtml), '设置页需要「窗口承载方式」开关');
     assert(/windowEmbed === false/.test(mainJs), 'main 必须能识别独立窗口模式');
     assert(/openDetached/.test(appwinJs), 'appwin 需要 openDetached');
-    assert(/detached:\s*displaySettings\(\)\.windowEmbed === false/.test(mainJs), '开窗口时要带上 detached');
+    // 以前是 `detached: displaySettings().windowEmbed === false` 的行内写法，
+    // 现在提到局部变量（因为还要据此决定 showWhileWaiting），两者都认。
+    assert(/detached:\s*displaySettings\(\)\.windowEmbed === false/.test(mainJs)
+      || /const detached = displaySettings\(\)\.windowEmbed === false/.test(mainJs),
+      '开窗口时要带上 detached');
 
     // 独立模式绝不能 SetParent——那正是嵌入问题的根源
     // （只看真正的代码行，注释里提到 SetParent 是在解释为什么不用它）
@@ -1023,12 +1030,15 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(/initLand !== curLand/.test(engJs), '只在宽高顺序相反（真躺倒）时才重锁方向');
     // 横屏平板模式的稳定性：没躺倒也要校验 ignore-orientation + density 是否丢失并补齐
     assert(/mSetIgnoreOrientationRequest=true/.test(engJs), '横屏要校验 ignore-orientation 是否还在');
-    assert(/Override density:\s*190|density.*190/.test(engJs), '横屏要校验 density 190 是否还在');
+    assert(/Override density:/.test(engJs), '要读 Override density 判断是否丢失');
+    assert(/tabletMode/.test(engJs), '平板排版开关要能被关掉');
     assert(/wm set-ignore-orientation-request true/.test(engJs), '丢了要补 ignore-orientation');
-    assert(/wm density 190/.test(engJs), '丢了要补 density 190');
+    assert(/wm density \$\{densityWanted\}/.test(engJs), '丢了要补 density');
     assert(/_healOrientation/.test(engJs.slice(engJs.indexOf('startWatchdog'))), '看门狗要周期自愈');
-    // 应用刚起来 Activity 重建会覆盖方向，需要在那个时机补一次
-    assert(/onAppUp[\s\S]{0,600}_healOrientation/.test(mainJs), '应用起来后要立刻校正一次');
+    // 应用刚起来 Activity 重建会覆盖方向，需要在那个时机补一次。
+    // 窗口放宽到 2200 字符：onAppUp 的 then 回调里还要处理开机动画淡出，
+    // 那些注释会把 _healOrientation 往后推，600 字符的窗口一加东西就误报。
+    assert(/onAppUp[\s\S]{0,2200}_healOrientation/.test(mainJs), '应用起来后要立刻校正一次');
     // 面板方向和设置不一致时不能靠这里修，要交给重启
     assert(/panelLandscape/.test(engJs), '要能区分「该重启」和「该重锁方向」');
   });
@@ -2078,6 +2088,78 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     }
   });
 
+  await test('只读运行时目录（MSIX 包内）：可写数据必须改道用户数据目录', () => {
+    const fs2 = require('fs');
+    const os2 = require('os');
+    const tmp = fs2.mkdtempSync(path.join(os2.tmpdir(), 'ro-root-'));
+    const oldAppData = process.env.APPDATA;
+    process.env.APPDATA = path.join(tmp, 'appdata');
+    try {
+      const store = require('../src/core/store');
+      const { Provisioner } = require('../src/core/provision');
+      // 造一个「不可写」的 root：把中间一级做成普通文件，mkdir 必然 EEXIST/ENOTDIR
+      const blocker = path.join(tmp, 'blocker');
+      fs2.writeFileSync(blocker, 'x');
+      const roRoot = path.join(blocker, 'rt');
+      store.saveSettings({ runtime: { dir: roRoot } });
+      const p = new Provisioner(path.join(__dirname, '..'));
+      const paths = p.paths();
+      assert(paths.rootWritable === false, '只读目录要被识别成不可写');
+      // 关键：镜像必须展开到用户数据目录，而不是包内（包内只读，展开会失败）
+      assert(paths.sysImgRoot === path.join(store.DATA_DIR, 'system-images'),
+        `只读时应落在数据目录，实际 ${paths.sysImgRoot}`);
+      assert(paths.tmp.toLowerCase().startsWith(store.DATA_DIR.toLowerCase()), '_tmp 也要改道');
+      assert(paths.avdHome.toLowerCase().startsWith(store.DATA_DIR.toLowerCase()), 'AVD 也必须在可写目录');
+      // 可执行文件仍然指向包内（这样才有包身份，%APPDATA% 虚拟化视图才和父进程一致）
+      assert(paths.emulatorExe === path.join(roRoot, 'emulator', 'emulator.exe'), 'emulator 仍从包内运行');
+      assert(paths.adbExe === path.join(roRoot, 'platform-tools', 'adb.exe'), 'adb 仍从包内运行');
+      // ensureDirs 不能因为 root 只读就抛错
+      p.ensureDirs();
+    } finally {
+      if (oldAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = oldAppData;
+      fs2.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test('包内压缩镜像必须算「已就位」，否则装完还会联网重下 1.5GB', () => {
+    const fs2 = require('fs');
+    const os2 = require('os');
+    const tmp = fs2.mkdtempSync(path.join(os2.tmpdir(), 'packed-img-'));
+    const oldAppData = process.env.APPDATA;
+    process.env.APPDATA = path.join(tmp, 'appdata');
+    const sparse = (file, size) => {
+      fs2.mkdirSync(path.dirname(file), { recursive: true });
+      fs2.writeFileSync(file, '');
+      fs2.truncateSync(file, size);   // 稀疏文件：不真占盘，只是体积够大
+    };
+    try {
+      const store = require('../src/core/store');
+      const { Provisioner } = require('../src/core/provision');
+      // 模拟完整版安装包 / 商店 MSIX：运行时目录里只有 .xz，没有展开的 system.img
+      const root = path.join(tmp, 'rt');
+      const dir = path.join(root, 'system-images', 'android-34', 'google_apis_playstore', 'x86_64');
+      sparse(path.join(dir, 'system.img.xz'), 320 * 1024 * 1024);
+      fs2.writeFileSync(path.join(dir, 'kernel-ranchu'), 'x');
+      store.saveSettings({ runtime: { dir: root } });
+      // appRoot 用空目录，避免被仓库里已展开的 engine/system-images 干扰
+      const p = new Provisioner(path.join(tmp, 'empty-app'));
+      const sys = p.systemImageInfo();
+      assert(sys.ok === true, '压缩镜像要算就位（否则 autoDeploy 会去下载）');
+      assert(sys.compressed === true, '要标记「还需展开一次」');
+      assert(String(sys.dir).toLowerCase().startsWith(root.toLowerCase()), '应指向包内位置');
+      const play = p.playImageInfo();
+      assert(play.ok === true && play.compressed === true, '兼容镜像同理');
+
+      // 展开后（有了 system.img）要变成 compressed=false，且优先用展开的那份
+      sparse(path.join(dir, 'system.img'), 320 * 1024 * 1024);
+      const after = p.systemImageInfo();
+      assert(after.ok === true && after.compressed === false, '展开后不应再标记为压缩版');
+    } finally {
+      if (oldAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = oldAppData;
+      fs2.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   console.log('\n[资源策略 / 磁盘分配 / 日志上限]');
 
   await test('资源策略一处切换，自动翻译成 vCPU/优先级/分辨率', () => {
@@ -2255,6 +2337,180 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(parseResolvedActivity('com.phoenix.read', out)
       === 'com.phoenix.read/com.dragon.read.pages.splash.SplashActivity', '应跳过空行取到最后一行组件');
     assert(parseResolvedActivity('com.other', out) === '', '别的包名不能拿来用');
+  });
+
+  await test('单个应用窗口：独立模式下壳窗口绝不能被显示出来', () => {
+    const root = path.join(__dirname, '..');
+    const appwin = fs.readFileSync(path.join(root, 'src', 'core', 'appwin.js'), 'utf8');
+    // maximize() 会把 show:false 的 BrowserWindow 直接显示出来 —— 这是
+    // 「打开应用出现多个窗口」的直接成因之一。
+    assert(/fullscreen && !this\.detachedMode\) this\.win\.maximize\(\)/.test(appwin),
+      '独立窗口模式不能 maximize 壳窗口（会凭空显示一个黑窗口）');
+    assert(/if \(this\.detachedMode\) this\.agent\.show\(\)/.test(appwin),
+      '独立模式下重复点同一个应用要把模拟器窗口抬到前面，而不是显示壳窗口');
+    // ready-to-show 里也不能随便 show：只有在 showWhileWaiting（切换应用、没有
+    // 开机动画兜底）时才允许先把这块「正在打开…」的壳显示出来。
+    const readyIdx = appwin.indexOf("once('ready-to-show'");
+    assert(readyIdx > 0 && /if \(this\.detachedMode && !this\._showWhileWaiting\) return;/
+      .test(appwin.slice(readyIdx, readyIdx + 600)),
+    '独立模式下 ready-to-show 默认必须直接 return');
+  });
+
+  await test('开机动画：splash 状态必须是模块级，否则永远关不掉', () => {
+    const root = path.join(__dirname, '..');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    // runLaunch / autoDeploy 定义在 whenReady 回调**外面**，回调里 const 的
+    // splashDone 它们根本看不到（typeof 恒为 'undefined'）—— 曾经导致
+    // 480x360 的 alwaysOnTop 开机动画一直钉在屏幕中央。
+    assert(/^let splashWin = null;$/m.test(mainJs), 'splashWin 必须是模块级 let');
+    assert(/^let splashDone = \(\) => \{\};$/m.test(mainJs), 'splashDone 必须是模块级 let');
+    assert(/^let splashProgress = \(\) => \{\};$/m.test(mainJs), 'splashProgress 必须是模块级 let');
+    assert(!/const splashDone = \(\) =>/.test(mainJs), '不能再在 whenReady 里用 const 覆盖');
+    // 保险丝：splash 自己没关掉时主进程强关
+    assert(/setTimeout\(\(\) => \{[\s\S]{0,160}splashWin\.close\(\);/.test(mainJs),
+      'splashDone 之后要有一道强关保险丝');
+  });
+
+  await test('多窗口：启动应用要先收起管理窗口再开应用窗口', () => {
+    const root = path.join(__dirname, '..');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    const launchIdx = mainJs.indexOf('async function runLaunch(');
+    const body = mainJs.slice(launchIdx, launchIdx + 1600);
+    const hideIdx = body.indexOf('mainWindow.hide()');
+    const openIdx = body.indexOf('openAppWindow(pkg');
+    assert(hideIdx > 0 && openIdx > 0, '两个调用都要在 runLaunch 里');
+    assert(hideIdx < openIdx, 'mainWindow.hide() 必须在 openAppWindow 之前（否则会同时看到两个窗口）');
+  });
+
+  await test('横竖屏：面板方向必须跟应用声明一致，否则只会信箱化', () => {
+    const root = path.join(__dirname, '..');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    const apkJs = fs.readFileSync(path.join(root, 'src', 'core', 'apk.js'), 'utf8');
+    const storeJs = fs.readFileSync(path.join(root, 'src', 'core', 'store.js'), 'utf8');
+    const installerJs = fs.readFileSync(path.join(root, 'src', 'core', 'installer.js'), 'utf8');
+
+    assert(/function wantLandscapeFor\(pkg\)/.test(mainJs), '要有「这个应用该用哪个方向」的判定');
+    assert(/orientationMode/.test(mainJs), '要读设置里的方向策略');
+    assert(/orientationOverride/.test(mainJs), '单应用方向覆盖要生效');
+    // 启动路径要用它，而不是裸的 displaySettings().landscape
+    assert(/const wantLand = wantLandscapeFor\(pkg\)/.test(mainJs), 'beforeStart 要按应用方向判定');
+    assert(/const land = wantLandscapeFor\(pkg\)/.test(mainJs), 'openAppWindow 要按应用方向开窗口');
+    // 离线从 APK 清单算方向
+    assert(/function detectOrientation\(/.test(apkJs), '要从 APK 清单离线判断应用方向');
+    assert(/orientation,/.test(apkJs), 'parseApk 要返回 orientation');
+    assert(/orientation: meta\.orientation/.test(installerJs), '安装时要把方向存进 apps.json');
+    assert(/orientationMode: 'auto'/.test(storeJs), '默认策略是跟随应用');
+    // 老数据回填：不补就还是黑边
+    assert(/orientation backfill/.test(mainJs), '老版本装的应用要回填方向');
+  });
+
+  await test('横竖屏：方向不一致触发的重启不能把启动打断', () => {
+    const root = path.join(__dirname, '..');
+    const installerJs = fs.readFileSync(path.join(root, 'src', 'core', 'installer.js'), 'utf8');
+    // beforeStart 会返回新的 rt，以前这里写的是 const rt，一旦真走重启分支就
+    // 抛 "Assignment to constant variable."，整个启动失败。
+    assert(/let rt = await this\.runtime\.ensure\(\{ onLog \}\)/.test(installerJs),
+      'rt 必须是 let，否则重启换 client 时会崩');
+    assert(/if \(replaced && replaced\.client\) rt = replaced;/.test(installerJs), '要接受新的 rt');
+  });
+
+  await test('切换应用不能留空屏：独立模式下等待期间要显示壳窗口', () => {
+    const root = path.join(__dirname, '..');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    const appwin = fs.readFileSync(path.join(root, 'src', 'core', 'appwin.js'), 'utf8');
+    // 独立窗口模式（默认）下壳窗口平时不显示；切换应用到另一个方向会重启运行时
+    // 约 40 秒，这期间如果什么都不显示，用户会以为程序崩了。
+    assert(/showWhileWaiting: detached && !splashVisible/.test(mainJs),
+      '独立模式且没有开机动画时，必须 showWhileWaiting');
+    assert(/splashVisible = !!\(splashWin && !splashWin\.isDestroyed\(\)\)/.test(mainJs),
+      '要靠 splash 是否在显示来决定由谁负责告诉用户「正在等」');
+    assert(/const willRestart = land !== !!displaySettings\(\)\.landscape/.test(mainJs),
+      '要能预判「这次会重启」');
+    assert(/if \(this\.detachedMode && !this\._showWhileWaiting\) return;/.test(appwin),
+      'ready-to-show 只在 showWhileWaiting 时才显示壳窗口');
+    assert(/正在为《[\s\S]{0,40}切换到/.test(mainJs), '提示文案要说清为什么慢');
+  });
+
+  await test('标题要在 show 之前设，否则会闪上一个应用的名字', () => {
+    const root = path.join(__dirname, '..');
+    const appwin = fs.readFileSync(path.join(root, 'src', 'core', 'appwin.js'), 'utf8');
+    const start = appwin.indexOf('async openDetached(');
+    const body = appwin.slice(start, start + 2000);
+    const titleIdx = body.indexOf('this.agent.setTitle(');
+    const showIdx = body.indexOf('this.agent.show()');
+    assert(titleIdx > 0 && showIdx > 0, '两个调用都要在 openDetached 里');
+    assert(titleIdx < showIdx, 'setTitle 必须在 show 之前（代理缓存着上次的标题）');
+  });
+
+  await test('网络体检不能一次不过就叫人重置数据', () => {
+    const root = path.join(__dirname, '..');
+    const emuJs = fs.readFileSync(path.join(root, 'src', 'core', 'emulator.js'), 'utf8');
+    // Wi-Fi 关联比 sys.boot_completed 晚 5~20 秒，查一次就报「没有网络」等于每次
+    // 冷启动都误报；而以前的补救建议是「重置安卓数据」（会删掉已装应用）。
+    assert(/checkNetwork\('', \{ waitMs: \d+, interval: \d+ \}\)/.test(emuJs),
+      '开机后的网络体检要给等待窗口，不能查一次就下结论');
+    const boot = emuJs.slice(emuJs.indexOf('运行时就绪'));
+    const warn = boot.slice(0, 4000);
+    // 只看代码行：上面解释「以前这里建议重置数据」的注释不算
+    const warnCode = warn.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    assert(!/重置安卓数据/.test(warnCode), '这条提示不能建议「重置安卓数据」（会丢已装应用）');
+    assert(/暂时没连上网/.test(warnCode), '要改成不吓人、不误导的说法');
+  });
+
+  await test('开机时那个控制台黑窗要用高频通道压掉', () => {
+    const root = path.join(__dirname, '..');
+    const ps1 = fs.readFileSync(path.join(root, 'src', 'core', 'win', 'agent.ps1'), 'utf8');
+    // emulator 拉起 qemu 时 Windows 会新建一个控制台窗口（Win11 上是 Windows Terminal），
+    // 只活 200~300ms；主巡检 250ms 一轮会漏。
+    assert(/_consoleSweep/.test(ps1), '要有独立的控制台扫描时间戳');
+    assert(/now - _consoleSweep > \(_perfMode \? 200 : 100\)/.test(ps1), '前 15 秒要 100ms 一轮扫控制台');
+    assert(/now - _bootHideStart < 15000/.test(ps1), '高频通道只在开机窗口内跑，避免长期烧 CPU');
+    // 必须是「控制台类窗口 + 标题命中运行时路径」，不能退回按 pid 白名单
+    assert(/static void HideConsoleWindows\(\)/.test(ps1) && /IsOurConsole\(h\)/.test(ps1),
+      '控制台归属要靠 IsOurConsole（conhost 的 pid 不是 emulator 的）');
+  });
+
+  await test('重启换面板后不能「复用」一台已经关掉的模拟器', () => {
+    const root = path.join(__dirname, '..');
+    const emuJs = fs.readFileSync(path.join(root, 'src', 'core', 'emulator.js'), 'utf8');
+    // emulator.exe 只是启动器，spawn 完 qemu 自己就退出了，但 this.proc 会一直留着
+    // （killed 仍是 false）。只看它 = 把已经关掉的机器当成还活着：
+    // restartForOrientation 关掉机器后紧接着 ensure() → start() 直接 reused，
+    // 调用方拿着死掉的 serial 去 adb → `device not found`，切换应用直接失败。
+    const reuse = emuJs.slice(emuJs.indexOf('async start('), emuJs.indexOf('async start(') + 900);
+    assert(/_consoleAlive\(\)/.test(reuse), 'start() 的复用分支必须再确认控制台端口上真有机器');
+    assert(/this\.proc = null;/.test(reuse), '确认没在跑就把 proc 清掉，走真正的开机流程');
+    // stop() 关干净后必须丢掉启动器句柄，否则 running() 永远为 true
+    const stopFn = emuJs.slice(emuJs.indexOf('async stop('), emuJs.indexOf('async stop(') + 1800);
+    assert(/killAttempt\(\)[\s\S]{0,200}this\.proc = null;/.test(stopFn), 'stop() 收尾要清掉 this.proc');
+  });
+
+  await test('Windows Terminal 弹出的开机黑框也要能认出来', () => {
+    const root = path.join(__dirname, '..');
+    const ps1 = fs.readFileSync(path.join(root, 'src', 'core', 'win', 'agent.ps1'), 'utf8');
+    // Win11 把默认控制台宿主换成 Windows Terminal 后，qemu 的控制台窗口属于
+    // WindowsTerminal.exe：pid/父进程链/标题全都不是我们的，只能靠「开机前不存在」
+    assert(/static void SnapshotConsoles\(\)/.test(ps1), '开机前要记下已有控制台窗口');
+    assert(/_consolesBeforeBoot/.test(ps1), '要有开机前的控制台快照');
+    assert(/now - _bootHideStart < 20000[\s\S]{0,120}_consolesBeforeBoot\.Contains/.test(ps1),
+      '只认「开机后 20 秒内新出现的」控制台窗口');
+    assert(/tl\.IndexOf\("terminal", StringComparison\.Ordinal\) >= 0/.test(ps1),
+      '标题是空或带 terminal 才算可疑（用户已开的终端在快照里）');
+    assert(/SnapshotConsoles\(\);/.test(ps1), 'boothide 时要先拍快照');
+  });
+
+  await test('启动要串行化：连点/切换应用不能并发跑两遍', () => {
+    const root = path.join(__dirname, '..');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    // 一次启动最长 80 秒（换面板重启 + 冷启动）。以前这期间再点一个应用会真的
+    // 并发跑第二遍：openAppWindow 把正在启动的应用关掉，虚拟机又在重启，
+    // 两边一起失败，日志里是 `cmd: Can't find service: activity`。
+    assert(/let launchInFlight = null;/.test(mainJs), '要有进行中启动的记录');
+    assert(/if \(launchInFlight\.pkg === pkg\)[\s\S]{0,120}return launchInFlight\.promise;/.test(mainJs),
+      '同一个应用连点要复用进行中的那次');
+    assert(/launch queued \$\{pkg\}/.test(mainJs), '换应用要排队而不是把运行时抽走');
+    assert(/async function launchOne\(pkg\)/.test(mainJs), '原主体要拆成 launchOne');
+    assert(/launchInFlight = entry;/.test(mainJs), '要在 finally 里清空，避免卡死后续启动');
   });
 
   console.log(results.join('\n'));

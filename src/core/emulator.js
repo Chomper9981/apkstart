@@ -1021,7 +1021,17 @@ class EmulatorEngine {
    */
   async start({ headless = false, onLog = () => {}, probe = null, maxAttempts = 4 } = {}) {
     if (this.proc && !this.proc.killed) {
-      return { ok: true, reused: true, serial: this.serial, port: this.port };
+      // 关键：emulator.exe 只是启动器，spawn 完 qemu 自己就退出了，而这个 proc
+      // 对象会一直留着（killed 仍是 false）。只看它会把「已经关掉的机器」当成
+      // 还活着 —— 重启换面板后紧接着 ensure() 就踩过这个坑：start() 直接返回
+      // reused，调用方拿着一个已经死掉的 serial 去 adb，报 `device not found`，
+      // 表现就是「切换应用到另一个方向的 App 直接失败」。
+      // 所以必须再确认控制台端口上真的有机器在跑，才算复用。
+      if (await this._consoleAlive()) {
+        return { ok: true, reused: true, serial: this.serial, port: this.port };
+      }
+      onLog(t('上一次的模拟器已经退出，重新开机…'));
+      this.proc = null;
     }
 
     const loc = this.locate();
@@ -1226,10 +1236,18 @@ class EmulatorEngine {
         onLog(t('运行时就绪（{s}s，{plan}）', { s: Math.round(bootMs / 1000), plan: plan.label }));
         // 开机成功不等于能用：顺手体检网络。虚拟机没网时，需要联网的页面会一直黑屏，
         // 用户只会说「这个应用黑屏」，很难联想到是网络。这里主动查一次并说清楚。
+        //
+        // 但不能「查一次就下结论」：Wi-Fi 关联 + DHCP 普遍比 sys.boot_completed 晚
+        // 5~20 秒，以前这里只调 checkNetwork() 一次，于是**每次冷启动**都会打一条
+        // 「⚠ 没有网络，请重置安卓数据」，而 5 秒后网络就绪了 —— 用户照着做就会
+        // 丢光已装应用。现在给它 12 秒等待窗口（就绪即返回），真超时才提示，
+        // 而且不再建议破坏性操作。
         let network = null;
-        try { network = await this.checkNetwork(); } catch (_) { /* 体检失败不算启动失败 */ }
+        try {
+          network = await this.checkNetwork('', { waitMs: 12000, interval: 3000 });
+        } catch (_) { /* 体检失败不算启动失败 */ }
         if (network && !network.ok) {
-          onLog(t('⚠ 安卓虚拟机当前没有网络：需要联网的应用（如红果、短剧类）打开后会一直黑屏。可在「设置 → 修复网络」重置安卓数据来修（应用清单会保留，点开时会自动重装）。'));
+          onLog(t('⚠ 安卓虚拟机暂时没连上网（Wi-Fi 未关联或没拿到地址）。需要联网的应用打开后可能一直黑屏：稍后重开应用即可；若持续无网，可在「设置 → 修复网络」重连（不会删除已装应用）。'));
         }
         return {
           ok: true, serial: this.serial, port, accel: accelInfo, logFile,
@@ -1352,6 +1370,9 @@ class EmulatorEngine {
       await sleep(300);
     }
     await this.killAttempt();
+    // 关干净了就把启动器句柄丢掉。留着它会让 running() 永远返回 true、
+    // start() 以为还能复用（见 start() 里的注释）。
+    this.proc = null;
     return true;
   }
 

@@ -1,13 +1,33 @@
 'use strict';
 /**
  * 本地持久化：应用清单 + 设置
- * 数据目录：%APPDATA%\apkstart
+ * 数据目录：%APPDATA%\apkstart（MSIX/商店版见下面的 STORE_BUILD 说明）
  */
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const DATA_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'apkstart');
+/**
+ * 是不是 Microsoft Store（MSIX / APPX）打包版？
+ *
+ * MSIX 的 full-trust 应用会把 `%APPDATA%` / `%LOCALAPPDATA%` 下的**写入**
+ * 重定向到 `%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\...`，
+ * 但环境变量和 API 返回的仍然是被重定向前的「真路径」。这会造成两类事故：
+ *   1. 我们从 %APPDATA%\apkstart 里 spawn 出来的 emulator/adb/qemu 若没有包身份，
+ *      按真路径去找文件会「文件不存在」；
+ *   2. 用户点「打开数据目录」看到的是空目录。
+ * 所以商店版直接把数据目录放到 AppData **之外**（%USERPROFILE%\ApkStart），
+ * 完全不进虚拟化范围，父子进程看到的是同一份真实文件。
+ *
+ * process.windowsStore 由 Electron 在 MSIX/APPX 环境下注入（普通 node 下是 undefined）。
+ */
+const STORE_BUILD = (() => {
+  try { return !!require('electron').app?.isPackaged && !!process.windowsStore; } catch (_) { return false; }
+})();
+
+const DATA_DIR = STORE_BUILD
+  ? path.join(os.homedir(), 'ApkStart', 'data')
+  : path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'apkstart');
 const ICON_DIR = path.join(DATA_DIR, 'icons');
 const APK_DIR = path.join(DATA_DIR, 'apks');
 const APPS_FILE = path.join(DATA_DIR, 'apps.json');
@@ -147,6 +167,17 @@ const DEFAULT_SETTINGS = {
     // 横屏 = 把 AVD 物理面板换成 1280x720 并重启（唯一能得到正立+铺满的方式）。
     // 持久化在这里，重启 ApkStart 后仍按这个方向开机。
     landscape: false,
+    // 屏幕方向策略：
+    //   auto      = 按应用自己声明的方向自动换物理面板（推荐，只有这样画面才能铺满窗口）
+    //   landscape = 强制横屏面板
+    //   portrait  = 强制竖屏面板
+    // 上面的 landscape 字段在 auto 模式下退化成「当前面板实际方向」这个事实，
+    // 由 restartForOrientation 写入，不再当偏好去覆盖应用自己的方向。
+    orientationMode: 'auto',
+    // 平板排版：把 guest 的逻辑密度覆盖成 190dpi（720 宽 → sw606dp ≥ 600dp，
+    // 越过 Android 的平板断点）。红果短剧这类应用只有在平板排版下才有双列剧集页，
+    // 也是用户要的「平板模式」。关掉就回到镜像默认密度（手机排版）。
+    tabletMode: true,
     // 窗口模式：true=把安卓画面嵌进 ApkStart 自己的窗口（观感统一）；
     // false=让模拟器开自己的原生窗口（绕开嵌入固有的黑边/坐标错位/铺不满问题）。
     windowEmbed: true,
@@ -214,6 +245,8 @@ function resourcePreset(mode) {
 const store = {
   DATA_DIR, ICON_DIR, APK_DIR,
   existingUser: EXISTING_USER,
+  // 商店（MSIX）打包版标记：main.js 据此关掉自更新、跳过需要管理员权限的内核驱动安装
+  STORE_BUILD,
 
   getSettings() {
     const s = deepMerge(DEFAULT_SETTINGS, readJson(SETTINGS_FILE, {}));

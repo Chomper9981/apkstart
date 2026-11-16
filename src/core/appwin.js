@@ -102,16 +102,27 @@ class AppWindow {
 
   /**
    * 打开（或复用）应用窗口。
-   * @param {object} o { pkg, label, iconPath, portrait, fullscreen, detached, onClosed }
-   *        detached=true 时走「独立窗口模式」：壳窗口只加载不显示，画面在模拟器原生窗口里
+   * @param {object} o { pkg, label, iconPath, portrait, fullscreen, detached,
+   *                     showWhileWaiting, onClosed }
+   *        detached=true 时走「独立窗口模式」：壳窗口只加载不显示，画面在模拟器原生窗口里。
+   *        showWhileWaiting=true 时，**在等待期间**先把壳窗口显示出来（带提示文案），
+   *        等模拟器窗口接上后由 openDetached() 收起。切换应用到另一个方向的 App
+   *        需要重启运行时（约 40 秒），这段时间以前屏幕上什么都没有，用户以为崩了。
    */
   open(o) {
     const { pkg, label, iconPath, portrait, fullscreen, detached } = o;
     this.detachedMode = !!detached;
+    this._showWhileWaiting = !!o.showWhileWaiting;
     this._closedCb = o.onClosed || null;
     if (this.isOpen && this.pkg === pkg) {
-      this.win.show();
-      this.win.focus();
+      // 独立窗口模式下壳窗口永远不该露脸（它没有内容，只是一块黑）。
+      // 这时候用户再点一次同一个应用，想要的是「把正在看的窗口拿到前面」，
+      // 交给窗口代理去抬模拟器原生窗口。
+      if (this.detachedMode) this.agent.show().catch(() => {});
+      else {
+        this.win.show();
+        this.win.focus();
+      }
       return this.win;
     }
     this.close({ keepApp: true });
@@ -168,7 +179,9 @@ class AppWindow {
     this.win.once('ready-to-show', () => {
       // 独立窗口模式下，安卓画面在模拟器自己的原生窗口里，我们这层壳没有内容可显示，
       // 留着只会多一个黑色空窗口。所以只加载、不显示（外壳仍存在，供状态/关闭逻辑用）。
-      if (this.detachedMode) return;
+      // 例外：showWhileWaiting（切换应用时没有开机动画兜底）—— 这时宁可先显示这块
+      // 「正在打开 xxx…」的壳，也不要让用户对着空桌面等 40 秒。
+      if (this.detachedMode && !this._showWhileWaiting) return;
       this.win.show();
       this._push();
     });
@@ -209,7 +222,10 @@ class AppWindow {
     this.win.on('focus', () => this._syncHook(true));
     this.win.on('blur', () => this._syncHook(false));
 
-    if (fullscreen) this.win.maximize();
+    // 注意：maximize() 会把 show:false 的窗口直接显示出来。
+    // 独立窗口模式下画面在模拟器原生窗口里，这里一 maximize 就会在屏幕正中
+    // 多出一个黑色空壳窗口 —— 用户反馈的「打开应用出现多个窗口」有一半来自这里。
+    if (fullscreen && !this.detachedMode) this.win.maximize();
     return this.win;
   }
 
@@ -280,23 +296,26 @@ class AppWindow {
    */
   async openDetached() {
     if (!this.isOpen) return false;
-    // 壳窗口在独立模式下绝不能露脸（它没有内容，只会是一块黑）
+    // 壳窗口在独立模式下绝不能露脸（它没有内容，只会是一块黑）。
+    // 但 showWhileWaiting 时它现在是可见的「等待提示」，这里负责收起它。
     try { this.win.hide(); } catch (_) { /* ignore */ }
     // 先确保它没被嵌在里面（从嵌入切过来时 _emu 的父窗口还是宿主）。
     // keep=true：告诉代理这是「切独立窗口」，不是「结束嵌入」——否则它会把
     // 用户正在看的模拟器窗口当成杂物藏掉。
     const dt = await this.agent.detach(true).catch((e) => ({ ok: false, error: e.message }));
     this._detachedDebug = `detach=${JSON.stringify(dt)}`;
+    // 标题必须在 show 之前设。
+    // 代理进程是常驻的，里面缓存着「上次设过的标题」（_ourTitle）；新模拟器窗口
+    // 一 show 出来就会先被套上那个旧标题 —— 切换应用时窗口会以**上一个应用的
+    // 名字**闪 0.5 秒，首次启动则先显示 "Android Emulator - apkstart:5554"。
+    // 以前的顺序是 show() → setTitle()，所以那半秒一定看得到。
+    const title = this.state && this.state.label ? this.state.label : 'ApkStart';
+    await this.agent.setTitle(title).catch(() => {});
     await sleep(600);
     // 让模拟器窗口真的可见
     const shown = await this.agent.show().catch((e) => ({ ok: false, error: e.message }));
     this._detachedDebug += ` show=${JSON.stringify(shown)}`;
     if (!shown || shown.ok === false) { this.lastEmbedError = this._detachedDebug; return false; }
-    // 窗口标题换成应用名，任务栏/Alt+Tab 里不该再出现 "Android Emulator - apkstart:5554"。
-    // 用户明确要求过「android emulator 的名称改为 apkstart」；这里优先用应用名，
-    // 没有标签时退回 ApkStart。代理会在巡检里持续补设，防止 Qt 自己改回去。
-    const title = this.state && this.state.label ? this.state.label : 'ApkStart';
-    await this.agent.setTitle(title).catch(() => {});
     // 图标也换成当前应用的：模拟器原生窗口默认是 Google 绿机器人，独立窗口模式
     // 下任务栏/Alt+Tab 会露馅。Win32 LoadImage 对 .ico 支持最可靠（PNG 不一定认），
     // installer 已为每个应用生成过同名 .ico，这里优先用它。
@@ -476,14 +495,26 @@ class AppWindow {
     if (!this.isOpen) return;
     // 独立窗口模式：画面在模拟器原生窗口里，壳窗口是隐藏的 —— maximize 一个隐藏
     // 窗口没有任何视觉效果（这正是「右上角按钮点了没反应」的原因）。这里改成把
-    // 模拟器窗口铺满工作区 / 还原到默认尺寸。
+    // 模拟器窗口铺满工作区 / 还原到之前的尺寸。
     if (this.detachedMode) {
       const area = this._area();
       if (this._detachedFullscreen) {
-        // 还原：回到按面板比例的居中默认尺寸
+        // 还原：回到全屏前记住的尺寸（如果有的话），否则用默认按比例居中
         this._detachedFullscreen = false;
-        await this.openDetachedLayoutOnly(area);
+        if (this._preFullscreenRect) {
+          await this.agent.layout(this._preFullscreenRect).catch(() => {});
+          this._preFullscreenRect = null;
+        } else {
+          await this.openDetachedLayoutOnly(area);
+        }
       } else {
+        // 全屏前记住当前窗口位置和大小，还原时用
+        try {
+          const probe = await this.agent.probe().catch(() => null);
+          if (probe && probe.w > 0 && probe.h > 0) {
+            this._preFullscreenRect = { x: probe.x, y: probe.y, w: probe.w, h: probe.h };
+          }
+        } catch (_) { /* 拿不到就还原时用默认 */ }
         this._detachedFullscreen = true;
         await this.agent.layout({ x: area.x, y: area.y, w: area.w, h: area.h })
           .catch(() => {});

@@ -124,6 +124,10 @@ public class ApkAgent
     static volatile bool _perfMode = false;
     static volatile bool _detachedMode = false;
     static long _bootHideSweep = 0;
+    // 控制台黑窗专用扫描时间戳。emulator 拉起 qemu 时 Windows 会给这个控制台
+    // 新开一个窗口（Win11 上是 Windows Terminal），它只活 200~300ms；主巡检
+    // 250ms 一轮抓不稳，所以前 15 秒额外用更密的节奏单独扫一遍控制台类窗口。
+    static long _consoleSweep = 0;
     // 兜底超时：万一 embed 没来（用户只是打开了 ApkStart 没点应用），
     // 不能让 120ms 一轮的扫描永远跑下去白烧 CPU。每次真藏到窗口就续期。
     static long _bootHideUntil = 0;
@@ -400,10 +404,54 @@ public class ApkAgent
         // 那会把用户自己开的终端（标题是某个路径，比如 D://Android//emulator）也一起藏掉。
         // 现在只认两种证据：conhost 的父进程链能走到我们运行时目录里，
         // 或者标题里出现我们运行时目录的绝对路径（Windows 会把镜像路径当控制台标题）。
+        long now = Environment.TickCount;
         foreach (IntPtr h in consoles)
         {
-            if (IsOurConsole(h)) ShowWindow(h, 0);
+            if (IsOurConsole(h)) { ShowWindow(h, 0); continue; }
+            // 第三条证据（Windows 11 才有）：默认控制台宿主换成 Windows Terminal 之后，
+            // 模拟器给 qemu 新开的那个控制台窗口属于 WindowsTerminal.exe ——
+            // pid 不是我们的、父进程链走不到我们、标题还经常只是个 "Terminal"，
+            // 上面两条证据全都命中不了，于是每次开机都在屏幕上闪 200~300ms 的黑框。
+            // 这里用「开机前不存在 + 开机后 20 秒内出现 + 标题是空的/就是 Terminal」
+            // 三个条件一起认。用户自己新开的终端一般已经有标题（PowerShell、某个路径），
+            // 不会被误伤；退一步说，真误伤了也只是藏起来，不会关掉他的进程。
+            if (_bootHideStart != 0 && now - _bootHideStart < 20000
+                && !_consolesBeforeBoot.Contains(h.ToInt64()))
+            {
+                string t = TitleOf(h);
+                string tl = t.ToLowerInvariant();
+                // 标题实测会变：可能是空、可能是 "Terminal"、也可能是 "Windows Terminal"
+                // （取决于 WT 版本和它当时有没有拿到 shell 标题）。这里只要求「像个控制台
+                // 宿主」——空标题，或者标题里带 terminal。
+                // 用户自己已经开着的终端都在 _consolesBeforeBoot 里，不会被误伤；
+                // 真误伤了也只是藏起来，不会关掉他的进程。
+                bool plain = t.Length == 0 || tl.IndexOf("terminal", StringComparison.Ordinal) >= 0;
+                if (plain)
+                {
+                    ShowWindow(h, 0);
+                }
+            }
         }
+    }
+
+    // 记录「开机（boothide）那一刻已经存在的控制台窗口」。
+    // Windows Terminal 会把我们的 qemu 控制台塞进一个新窗口，而这个窗口从 pid /
+    // 父进程 / 标题都认不出归属；用「开机前没有、开机后冒出来」来认最可靠。
+    static System.Collections.Generic.HashSet<long> _consolesBeforeBoot =
+        new System.Collections.Generic.HashSet<long>();
+
+    static void SnapshotConsoles()
+    {
+        _consolesBeforeBoot.Clear();
+        EnumWindows(delegate(IntPtr h, IntPtr p)
+        {
+            if (!IsWindowVisible(h)) return true;
+            string cls = ClassOf(h);
+            if (cls.IndexOf("ConsoleWindowClass", StringComparison.Ordinal) >= 0
+                || cls.IndexOf("CASCADIA_HOSTING_WINDOW_CLASS", StringComparison.Ordinal) >= 0)
+                _consolesBeforeBoot.Add(h.ToInt64());
+            return true;
+        }, IntPtr.Zero);
     }
 
     // 诊断用：列出当前「可见」的控制台窗口（黑窗）及其归属，供 tools 里的验证脚本使用。
@@ -1075,6 +1123,19 @@ public class ApkAgent
                 QuietSweep();
             }
 
+            // 控制台黑窗专用高频通道（只在前 15 秒、只枚举控制台类窗口）。
+            // 为什么需要：emulator 启动 qemu 时 Windows 会新建一个控制台窗口，
+            // 它的归属进程是 conhost / WindowsTerminal，IsOurs 为 false，只能靠
+            // IsOurConsole 的「标题 = 我们的运行时路径」来认。这类窗口只可见
+            // 200~300ms，250ms 一轮的主巡检有几率漏掉 —— 用户看到的就是开机时
+            // 闪一下黑框。这里 100ms 一轮，必然能在它消失前抓到。
+            if (_quiet && now - _bootHideStart < 15000
+                && now - _consoleSweep > (_perfMode ? 200 : 100))
+            {
+                _consoleSweep = now;
+                HideConsoleWindows();
+            }
+
             try
             {
                 // 连接已经断了（ApkStart 退出 / 异常崩溃）：不立刻收工。
@@ -1310,7 +1371,9 @@ public class ApkAgent
                         IntPtr e = FindEmulator();
                         RECT r = new RECT();
                         if (e != IntPtr.Zero) GetWindowRect(e, out r);
-                        Reply(sock, "{\"ok\":true,\"emu\":" + e.ToInt64() + ",\"w\":" + (r.R - r.L) + ",\"h\":" + (r.B - r.T) + "}");
+                        Reply(sock, "{\"ok\":true,\"emu\":" + e.ToInt64()
+                            + ",\"x\":" + r.L + ",\"y\":" + r.T
+                            + ",\"w\":" + (r.R - r.L) + ",\"h\":" + (r.B - r.T) + "}");
                     }
                     else if (cmd == "winready")
                     {
@@ -1346,7 +1409,9 @@ public class ApkAgent
                         {
                             _quiet = true;
                             _bootHideSweep = 0;
+                            _consoleSweep = 0;
                             _bootHideStart = Environment.TickCount;
+                            SnapshotConsoles();
                             QuietSweep();
                         }
                         else
