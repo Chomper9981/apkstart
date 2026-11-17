@@ -669,10 +669,12 @@ class EmulatorEngine {
     pipe(proc.stderr);
     proc.on('exit', (code) => {
       this.lastExitCode = code;
-      const meaning = describeExitCode(code, { raw: true });
-      this.log(`emulator exit ${code}${meaning ? `（${meaning}）` : ''}`);
-      this._logWrite(logFile, `emulator exit ${code}${meaning ? `（${meaning}）` : ''}\n`);
+      // 日志（供 doctor 正则分析）用固定原文；界面提示用当前语言
+      const raw = describeExitCode(code, { raw: true });
+      this.log(`emulator exit ${code}${raw ? `（${raw}）` : ''}`);
+      this._logWrite(logFile, `emulator exit ${code}${raw ? `（${raw}）` : ''}\n`);
       this.proc = null;
+      const meaning = describeExitCode(code);
       onLog(meaning ? t('运行时已退出（code={code}，{meaning}）', { code, meaning }) : t('运行时已退出（code={code}）', { code }));
     });
     proc.on('error', (e) => {
