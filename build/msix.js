@@ -426,6 +426,14 @@ function main() {
     console.log('\n未签名（Store 会用自己的证书重签，提交时不需要签名）。');
     console.log('本地想装的话加 --sign 生成自签证书并签名。');
   }
+  // stage 是 1.3 GB 的中间产物，留着没用还会让人以为「包里有两份」，
+  // 打包成功后直接清掉（要排查就加 --keep-stage）。
+  if (!process.argv.includes('--keep-stage')) {
+    try {
+      fs.rmSync(work, { recursive: true, force: true });
+      console.log('已清理中间目录 dist/store/.stage');
+    } catch (_) { /* 被占用就留着，不影响产物 */ }
+  }
   console.log(`\n提交前先读一遍 docs/store-msix.md。`);
 }
 

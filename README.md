@@ -40,11 +40,18 @@
 - GitHub：[github.com/RoutineMiku/apkstart/releases](https://github.com/RoutineMiku/apkstart/releases)
 - Gitee：[gitee.com/daily-miku/apkstart/releases](https://gitee.com/daily-miku/apkstart/releases)（国内直连快得多）
 
-安装包：
+安装包（三种形态，内容与版本号完全一致）：
 
-- **`ApkStart-v*-Setup.exe`**（约 1.3 GB）：**一个 EXE 包含全部运行时**（adb / Android Emulator / 系统镜像），装完首次启动自动把镜像展开到用户目录，**之后不再联网下载任何东西**。装到当前用户目录、不要求管理员权限。
-- **微软商店版（MSIX，`ApkStart_<版本>_x64.msix`）**：同样内置完整运行时，一次下载装完即用；安装目录是只读的 WindowsApps，所以自更新交给 Microsoft Store，硬件加速只走 Windows 自带的 WHPX。打包与上架流程见 [docs/store-msix.md](docs/store-msix.md)。
-- 另有轻量版 `ApkStart-v*-win64-portable.zip`（**95 MB**，解压后约 226 MB）：首次启动才在后台下载运行时。运行时的下载源就是**本项目的 GitHub Release**（`ApkStart-runtime-*.zip` 整包），不走 dl.google.com；整包拿不到时才自动退回官方源。
+| 形态 | 文件名 | 何时选它 |
+|---|---|---|
+| 商店版 | `ApkStart_<四段版本>_x64.msix` | 从 Microsoft Store 装。内置完整运行时，装完不联网；自更新交给商店 |
+| 完整便携版 | `ApkStart-v*-win64-full.zip`（约 830 MB，解压 ~1.3 GB） | **不想装、也不想等下载**：解压即用，运行时（模拟器 + 系统镜像）全在包里 |
+| 安装版 | `ApkStart-v*-Setup.exe`（约 1.3 GB） | 想要桌面/开始菜单快捷方式、卸载项 |
+| 轻量便携版 | `ApkStart-v*-win64-portable.zip`（96 MiB，解压 ~227 MB） | 只想先试试，首次启动再联网下载运行时 |
+
+> 所有形态的 `ApkStart.exe` 都写入了**品牌图标 + 版本资源**（FileDescription = `ApkStart 安卓应用运行器`，
+> CompanyName = `RoutineMiku`，版本与 `package.json` 同步），不再是 Electron 的默认图标和 `33.x` 版本号。
+> 自己从源码打包时：`npm run pack`（轻量）/ `npm run pack:full`（完整）/ `npm run build:msix`（商店包）。
 
 ### 画面铺满是怎么做到的
 
@@ -242,6 +249,47 @@ Android 版本、freeform 支持、共享目录双向同步，加 `--apk 某应�
 | 兼容模式下运行红果免费短剧（Android 14 · AEHD 硬件加速） |
 |:---:|
 | ![红果短剧在 ApkStart 兼容模式运行](docs/images/compat-hongguo-playing.png) |
+
+### 提示「未启用硬件加速」怎么办
+
+安卓模拟器在 Windows 上只有两条加速路：
+
+| 方式 | 是什么 | 谁需要管理员 | 装完要重启吗 |
+|---|---|---|---|
+| **WHPX** | Windows 自带功能「Windows 虚拟机监控程序平台」 | 开这个功能时 | 要 |
+| **AEHD** | Google 自家内核驱动 | 装驱动时 | 不用 |
+
+- **安装版 / 便携版**：设置 → 环境自检 → 「未启用硬件加速」右侧点**修复**，会弹一次 UAC，自动开 WHPX；如果开不起来（系统不支持 / 你点了否），会自动改装 AEHD 驱动。
+- **微软商店（MSIX）版**：商店应用**不能自行提权**，所以点「修复」会直接帮你打开「启用或关闭 Windows 功能」对话框，勾选
+  **「Windows 虚拟机监控程序平台」**（英文 HypervisorPlatform），确定后**重启电脑**一次即可。
+
+  也可以自己用管理员 PowerShell 跑：
+
+  ```powershell
+  dism /online /enable-feature /featurename:HypervisorPlatform /all /norestart
+  dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+  ```
+
+> 注意别只开「虚拟机平台（VirtualMachinePlatform）」——那是 WSL2 要用的，模拟器要的是
+> **「虚拟机监控程序平台（HypervisorPlatform）」**。只开前者，`emulator -accel-check` 依然会说不可用。
+>
+> 没加速也能跑（纯软件模拟），只是开机会慢到几分钟——这也是应用里那条提示的目的，
+> 不是启动失败。
+
+### 桌面图标不对 / 显示成 ApkStart 的图标怎么办
+
+每个安卓应用的桌面快捷方式都应该用它**自己的图标**（安装时从 APK 里解出来存到
+`%APPDATA%\apkstart\icons\<包名>.ico`）。如果显示成了 ApkStart 的绿色播放键，或者干脆是空白图标：
+
+1. **设置 → 系统集成 → 重建快捷方式**（会把桌面和开始菜单的快捷方式按当前应用清单重写一遍，
+   连同图标和任务栏身份一起修好）；
+2. 还不行就删掉那个快捷方式，在 ApkStart 里右键应用 → 重新创建快捷方式/重装一次。
+
+> 为什么会坏：早期版本整理图标时把这些 `.lnk` 图标的 `IconLocation` 统一指向了 ApkStart 的品牌图；
+> 另外把便携版整个目录挪到别处后，`.lnk` 里记的绝对路径也会失效。重建一次即可。
+>
+> 顺带说一句：每个应用的快捷方式都带自己的 AppUserModelID，
+> 所以**固定到任务栏**后，任务栏按钮和固定项用的是同一个应用图标，不会混成 ApkStart。
 
 ### 为什么我的 `adb devices` 看不到这台安卓设备
 
