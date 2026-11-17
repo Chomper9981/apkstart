@@ -1,7 +1,7 @@
 {
   "name": "apkstart",
   "productName": "ApkStart",
-  "version": "0.5.1",
+  "version": "0.5.3",
   "description": "极致轻量的 Windows 安卓应用运行器：双击 APK 即装，应用以独立窗口与桌面图标运行",
   "main": "src/main.js",
   "author": "RoutineMiku",
@@ -35,7 +35,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node test/run-tests.js && node test/engine-test.js && node test/auto-test.js && node test/i18n-test.js && node test/mcp-test.js",
+    "test": "node test/run-tests.js && node test/android-test.js && node test/range-validation-test.js && node test/engine-test.js && node test/auto-test.js && node test/i18n-test.js && node test/mcp-test.js",
     "check:i18n": "node tools/check-i18n.js",
     "test:ui-i18n": "node test/ui-i18n-layout-all.js",
     "test:i18n-smoke": "node test/i18n-app-smoke.js",
@@ -52,7 +52,9 @@
     "test:boot": "node test/boot-test.js",
     "pack:linux": "electron-builder --linux AppImage --config electron-builder.yml",
     "icons": "electron build/build-icons.js",
-    "shots": "electron build/store-shots.js"
+    "shots": "electron build/store-shots.js",
+    "pack:full": "node build/pack.js --full",
+    "build:all": "node build/pack.js && node build/pack.js --full && node build/msix.js"
   },
   "devDependencies": {
     "electron": "^33.4.11",

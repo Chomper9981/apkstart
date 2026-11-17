@@ -5,7 +5,7 @@
 $ErrorActionPreference = 'Continue'
 $root = 'D:\apkstart-dsh\apkstart'
 # 版本号从 package.json 现取，别在脚本里写死 —— 每次抬版本都改这里迟早会改漏。
-# MSIX 的版本是四段式（0.5.1 → 0.5.1.0），和 build/msix.js 的规则保持一致。
+# MSIX 的版本是四段式（0.5.2 → 0.5.2.0），和 build/msix.js 的规则保持一致。
 $ver = '0.0.0.0'
 try {
     # 必须显式 -Encoding UTF8：Windows PowerShell 5.1 的默认编码是 ANSI，
@@ -13,8 +13,8 @@ try {
     $pkg = Get-Content (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $ver = ('{0}.0' -f $pkg.version)
 } catch {
-    Write-Host '  [!] 读不到 package.json 的 version，退回按 0.5.1.0 找包' -ForegroundColor Yellow
-    $ver = '0.5.1.0'
+    Write-Host '  [!] 读不到 package.json 的 version，退回按 0.5.3.0 找包' -ForegroundColor Yellow
+    $ver = '0.5.3.0'
 }
 $msix = Join-Path $root ('dist\store\ApkStart_{0}_x64.msix' -f $ver)
 $guide = Join-Path $root 'docs\store-upload-walkthrough.md'

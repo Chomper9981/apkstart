@@ -2542,6 +2542,112 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
     assert(!/\['emulator\/lib64\/vulkan\/vk_swiftshader\.dll'/.test(slim), 'vk_swiftshader.dll 不能在删除清单里');
   });
 
+  await test('硬件加速：商店版引导用户开 WHPX，安装版一键开启并可退 AEHD', () => {
+    const root = path.join(__dirname, '..');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    const appJs = fs.readFileSync(path.join(root, 'src', 'ui', 'app.js'), 'utf8');
+    const preloadJs = fs.readFileSync(path.join(root, 'src', 'preload.js'), 'utf8');
+
+    // 1) 真正让模拟器用上 WHPX 的功能是 HypervisorPlatform（虚拟机平台是 WSL2 的），
+    //    必须排在最前面开；两个都开一次以覆盖不同机器。
+    assert(/for \(const f of \['HypervisorPlatform', 'VirtualMachinePlatform'\]\)/.test(mainJs),
+      '要先开 HypervisorPlatform（WHPX 真正需要的那个）');
+    // 2) 不能再拿 WinHvPlatform.dll 是否存在当开关：现代 Windows 上它一直都在，
+    //    这样判断会把真正需要开功能的机器挡在门外。
+    const handler = mainJs.slice(mainJs.indexOf("ipcMain.handle('provision:enableVirtualization'"));
+    const handlerBody = handler.slice(0, 4000);
+    assert(!/if \(hv\.dll\) \{/.test(handlerBody), '不能再按 WinHvPlatform.dll 分叉');
+    // 3) 商店（MSIX）版：拿不到提权就退回「手动引导」，而不是弹一个注定失败的 UAC
+    assert(/if \(store\.STORE_BUILD\) \{[\s\S]{0,900}manual: true/.test(handlerBody),
+      '商店版失败时要返回 manual 交给 UI 引导');
+    assert(/商店版无法自行提权/.test(mainJs), '商店版文案要说明为什么不能自动开');
+    assert(/虚拟机监控程序平台/.test(mainJs), '要明确写出「Windows 虚拟机监控程序平台」');
+    // 4) 开启成功后必须清掉加速缓存，否则界面还显示旧结论
+    assert(/const whpx = await enableWhpxFeatures\(\);\s*\n\s*runtime\.provisioner\.invalidateEnvCache/.test(mainJs),
+      '开启后要 invalidateEnvCache');
+    // 5) 用户点了「否」要能和真失败区分开（1223 = ERROR_CANCELLED）
+    assert(/1223/.test(mainJs) && /cancelled/.test(mainJs), '要区分 UAC 取消');
+    // 6) 有「Windows 虚拟机监控程序平台」那一项的是经典对话框，不是 ms-settings 页面
+    assert(/optionalfeatures\.exe/.test(mainJs), '要打开 classic optionalfeatures.exe');
+    // 7) UI 要处理 manual / cancelled，并真的去打开那个对话框
+    assert(/r\.manual/.test(appJs) && /api\.openWindowsFeatures/.test(appJs), 'UI 要处理 manual 分支');
+    assert(/openWindowsFeatures: \(\) => invoke\('provision:openWindowsFeatures'\)/.test(preloadJs),
+      'preload 要暴露 openWindowsFeatures');
+    // 8) 软件模拟下第一次启动要弹一次系统通知（设置里的自检项用户很可能没看到）
+    assert(/let accelWarned = false;/.test(mainJs) && /正在以软件模拟运行/.test(mainJs),
+      '软件模拟要提醒一次');
+  });
+
+  await test('打包必须写入 exe 图标/版本，否则资源管理器显示 Electron 默认图标', () => {
+    const root = path.join(__dirname, '..');
+    const packJs = fs.readFileSync(path.join(root, 'build', 'pack.js'), 'utf8');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    const pkg = require(path.join(root, 'package.json'));
+
+    // 直改名出来的 exe 里面还是 Electron：FileDescription=Electron、
+    // ProductName=Electron、CompanyName=GitHub, Inc.、版本 33.4.11，图标也是默认的。
+    assert(/function embedExeMeta\(exe\)/.test(packJs), '要有 exe 元信息写入步骤');
+    assert(/--set-icon/.test(packJs), '要写图标');
+    assert(/--set-file-version/.test(packJs), '要写文件版本');
+    assert(/--set-version-string', 'FileDescription'/.test(packJs), '要写 FileDescription');
+    assert(/--set-version-string', 'ProductName', 'ApkStart'/.test(packJs), 'ProductName 必须是 ApkStart');
+    assert(/embedExeMeta\(exePath\)/.test(packJs), '要在改名之后真的调用');
+    // 找不到 rcedit 时要明确告警，不能静默产出「Electron 图标」的包
+    assert(/找不到 rcedit\.exe/.test(packJs), '缺 rcedit 要告警');
+
+    // 任务栏身份：不设 AppUserModelID，任务栏固定项/通知会落到 "Electron" 上
+    assert(/setAumid\(APP_AUMID\);/.test(mainJs), '启动时要设置 AppUserModelID');
+
+    // 完整版（含运行时）作为一个可交付版本
+    assert(/--full/.test(packJs) && /ApkStart-v\$\{PKG\.version\}-win64-full/.test(packJs),
+      '--full 要产出带版本号的完整版目录');
+    assert(/build', 'runtime'/.test(packJs), '完整版要内置 build/runtime');
+  });
+
+  await test('版本统一：package.json / MSIX 四段号 / 文档包名一致', () => {
+    const root = path.join(__dirname, '..');
+    const pkg = require(path.join(root, 'package.json'));
+    const { msixVersion } = require(path.join(root, 'build', 'msix.js'));
+    const four = msixVersion(pkg.version);
+    assert(/^\d+\.\d+\.\d+\.0$/.test(four), `MSIX 四段版本号格式不对：${four}`);
+    const artifact = `ApkStart_${four}_x64.msix`;
+    for (const f of ['docs/store-listing.md', 'docs/store-msix.md', 'docs/store-upload-walkthrough.md']) {
+      const t = fs.readFileSync(path.join(root, f), 'utf8');
+      assert(t.includes(artifact), `${f} 里应引用当前版本的包名 ${artifact}`);
+    }
+    // exe 的文件版本也要用同一个号（四段），别和 package.json 各说各话
+    const packJs = fs.readFileSync(path.join(root, 'build', 'pack.js'), 'utf8');
+    assert(/\$\{PKG\.version\}\.0/.test(packJs), 'exe 文件版本要跟 package.json 对齐');
+    // 商店包和 exe 用的是同一个版本来源，不该有第二份硬编码版本号
+    const msixJs = fs.readFileSync(path.join(root, 'build', 'msix.js'), 'utf8');
+    assert(/const VERSION = String\(pkg\.version/.test(msixJs), 'MSIX 版本号必须取自 package.json');
+  });
+
+  await test('安卓应用的快捷方式必须用它自己的图标 + 自己的任务栏身份', () => {
+    const root = path.join(__dirname, '..');
+    const installerJs = fs.readFileSync(path.join(root, 'src', 'core', 'installer.js'), 'utf8');
+    const mainJs = fs.readFileSync(path.join(root, 'src', 'main.js'), 'utf8');
+    const shortcutJs = fs.readFileSync(path.join(root, 'src', 'core', 'shortcut.js'), 'utf8');
+
+    // 桌面/开始菜单快捷方式的图标 = 从 APK 里解出来的 <包名>.ico，绝不是 ApkStart 的品牌图
+    assert(/const ico = app\.icoPath && fs\.existsSync\(app\.icoPath\) \? app\.icoPath : undefined;/.test(installerJs),
+      '要用应用自己的 icoPath');
+    assert(/iconIcoPath: ico/.test(installerJs), 'writeShortcut 要拿到应用图标');
+    assert(!/iconIcoPath:\s*(APPICON|appicon|brandIcon)/.test(installerJs), '不能用 ApkStart 的品牌图标');
+    // 每个应用一个 AUMID：任务栏按应用分组，固定项才认得出是哪个应用
+    assert(/appUserModelId: `RoutineMiku\.ApkStart\.\$\{app\.package\}`/.test(installerJs),
+      '每个应用要有自己的 AUMID');
+    // Windows 只在「进程 AUMID == 快捷方式 AUMID」时沿用快捷方式图标，
+    // 所以打开某个应用时要把进程身份切过去，回管理窗口再切回 ApkStart。
+    assert(/const APP_AUMID = 'RoutineMiku\.ApkStart';/.test(mainJs), '要有统一的 AUMID 前缀');
+    assert(/setAumid\(`\$\{APP_AUMID\}\.\$\{pkg\}`\)/.test(mainJs), '开应用窗口前要切到该应用的 AUMID');
+    assert(/function showWindow\(\) \{\s*\n\s*\/\/[^\n]*\n\s*setAumid\(APP_AUMID\);/.test(mainJs),
+      '回管理窗口要切回 ApkStart 的 AUMID');
+    // writeShortcut 必须把 iconIndex 设成 0（ico 里第 0 帧），否则某些尺寸会取错
+    assert(/icon: opt\.iconIcoPath \|\| opt\.target/.test(shortcutJs), '图标路径要能回退到 target');
+    assert(/iconIndex: 0/.test(shortcutJs), 'iconIndex 要是 0');
+  });
+
   console.log(results.join('\n'));
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`);
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) { /* ignore */ }

@@ -11,7 +11,29 @@ const crypto = require('crypto');
 const { URL } = require('url');
 const { t } = require('../i18n');
 
+/** 范围校验失败：带稳定的 code，调用方/测试按 code 判断，不依赖界面语言 */
+function rangeError(msg) {
+  const e = new Error(msg);
+  e.code = 'RANGE_MISMATCH';
+  return e;
+}
+
 const UA = 'ApkStart/0.2 (Windows; +https://github.com/apkstart)';
+
+/**
+ * 校验服务器返回的 Content-Range 是否与本次请求一致。
+ * 断点续传/分块下载最怕「服务器不认 Range、从头发整包」或「返回了别的文件的分块」——
+ * 直接写进目标文件会拼出看似完整、实则损坏的包。这里逐项比对起止位、总大小和
+ * Content-Length，有任何不符就拒绝，交给上层换源/重来。
+ */
+function validRange(res, start, end, total) {
+  const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(res.headers['content-range'] || ''));
+  if (!m) return false;
+  const [a, b, size] = m.slice(1).map(Number);
+  const length = res.headers['content-length'];
+  return Number.isSafeInteger(size) && a === start && b === end && size === total &&
+    (length == null || Number(length) === end - start + 1);
+}
 
 function openStream(url, { method = 'GET', headers = {}, redirects = 0 } = {}) {
   return new Promise((resolve, reject) => {
@@ -101,14 +123,29 @@ async function download(url, dest, opt = {}) {
 
     if (res.statusCode === 416) {
       res.resume();
-      // 已下载完整
-      break;
+      // 416 有两种可能：文件真的下完了，或本地残片与目标对不上（服务器认为这个
+      // Range 不合法）。以前无条件当成功，会把坏残片留成"已下载"。这里只要带过
+      // Range 且还能重试，就清掉残片重新完整拉一遍；重试用尽仍未成功则报错。
+      if (existing > 0 && attempt <= retries + 1) {
+        discardPartial(dest);
+        continue;
+      }
+      throw rangeError(t('无法验证续传文件，服务器返回 HTTP 416'));
     }
     if (res.statusCode !== 200 && res.statusCode !== 206) {
       res.resume();
       if (attempt <= retries) { await new Promise((r) => setTimeout(r, 1500)); continue; }
       discardPartial(dest);   // 重试耗尽：别把坏文件留给下次续传
       throw new Error(t('下载失败 HTTP {code}: {url}', { code: res.statusCode, url }));
+    }
+
+    if (res.statusCode === 206) {
+      const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(res.headers['content-range'] || ''));
+      if (!m || !validRange(res, existing, Number(m[2]), Number(m[3])) || Number(m[2]) !== Number(m[3]) - 1) {
+        res.resume();
+        discardPartial(dest);
+        throw rangeError(t('服务器返回了不匹配的续传范围'));
+      }
     }
 
     const total = res.statusCode === 206
@@ -282,6 +319,10 @@ async function downloadParallel(url, dest, opt = {}) {
       res.resume();
       throw new Error(t('分块请求被拒绝 HTTP {code}', { code: res.statusCode }));
     }
+    if (!validRange(res, c.pos, c.end, total)) {
+      res.resume();
+      throw rangeError(t('服务器返回了不匹配的分块范围'));
+    }
     await new Promise((resolve, reject) => {
       // 必须自己兜住「promise 永远不 settle」：res.destroy(err) 在某些情况下只发
       // close 不发 error，没有这个 guard 的话一整块会挂死，整个下载停在那里不动。
@@ -298,6 +339,12 @@ async function downloadParallel(url, dest, opt = {}) {
         idle = setTimeout(() => { res.destroy(); finish(new Error(t('连接停滞（长时间无数据）'))); }, idleMs);
       };
       res.on('data', (buf) => {
+        // 服务器可能返回超出请求分块范围的数据，多出来的字节会写穿到别的分块，
+        // 拼出一个静默损坏的包。宁可判失败换源，不能让它落盘。
+        if (buf.length > c.end - c.pos + 1) {
+          res.destroy();
+          return finish(rangeError(t('分块响应超出请求范围')));
+        }
         try {
           fs.writeSync(fd, buf, 0, buf.length, c.pos);
         } catch (e) {
@@ -326,7 +373,7 @@ async function downloadParallel(url, dest, opt = {}) {
           throw new Error(t('分块未完整返回'));
         } catch (e) {
           c.tries += 1;
-          if (c.tries >= retries) throw new Error(t('分块下载失败（{start}-{end}）：{error}', { start: c.start, end: c.end, error: e.message }));
+          if (c.tries >= retries) throw Object.assign(new Error(t('分块下载失败（{start}-{end}）：{error}', { start: c.start, end: c.end, error: e.message })), e.code ? { code: e.code } : {});
           // eslint-disable-next-line no-await-in-loop
           await new Promise((r) => setTimeout(r, 800 * c.tries));
         }
@@ -496,6 +543,10 @@ async function downloadMulti(urls, dest, opt = {}) {
       res.resume();
       throw new Error(t('分块被拒绝 HTTP {code}', { code: res.statusCode }));
     }
+    if (!validRange(res, c.pos, c.end, total)) {
+      res.resume();
+      throw rangeError(t('服务器返回了不匹配的分块范围'));
+    }
     const startPos = c.pos;
     const startedAt = Date.now();
     // 同一条连接 destroy 之后仍可能再收到已缓冲的包，会重复触发换源、把源跳过头，
@@ -519,6 +570,11 @@ async function downloadMulti(urls, dest, opt = {}) {
         idle = setTimeout(() => { res.destroy(); finish(new Error(t('连接停滞（无数据超时）'))); }, idleMs);
       };
       res.on('data', (buf) => {
+        // 同上：拒绝超出请求范围的字节，避免静默写坏分块
+        if (buf.length > c.end - c.pos + 1) {
+          res.destroy();
+          return finish(rangeError(t('分块响应超出请求范围')));
+        }
         try {
           fs.writeSync(fd, buf, 0, buf.length, c.pos);
         } catch (e) {
@@ -567,7 +623,7 @@ async function downloadMulti(urls, dest, opt = {}) {
             // 拼不出正确字节。整包 + 边车一起作废，下次干净重来。
             // 以前这里只 saveMeta() 保留，结果每次打开都从坏块继续 → 无限重下。
             discardPartial(dest);
-            throw new Error(t('分块失败（{start}-{end}）：{error}', { start: c.start, end: c.end, error: e.message }));
+            throw Object.assign(new Error(t('分块失败（{start}-{end}）：{error}', { start: c.start, end: c.end, error: e.message })), e.code ? { code: e.code } : {});
           }
           // 换一个源再试：一个镜像抽风不该拖垮整个下载
           c.src += 1;
@@ -614,5 +670,5 @@ async function downloadAnyParallel(urls, dest, opt = {}) {
 
 module.exports = {
   download, downloadAny, downloadParallel, downloadAnyParallel, downloadMulti,
-  head, sha256File, openStream, discardPartial,
+  head, sha256File, openStream, discardPartial, validRange,
 };
