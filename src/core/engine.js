@@ -1163,6 +1163,8 @@ class Runtime {
    */
   async endApp(pkg, { onIdle = () => {} } = {}) {
     this._activeApps.delete(pkg);
+    // 空闲从「最后一个窗口关掉」这一刻算起：刚关掉就马上重开的场景仍然秒进
+    this.touch();
     await this.client().forceStop(pkg).catch(() => {});
     const state = container.nextSessionState([...this._activeApps], 'close', pkg);
     if (state.idle) {
@@ -1266,29 +1268,50 @@ class Runtime {
   startWatchdog() {
     if (this._watchdog) return;
     this._watchdog = setInterval(async () => {
-      const s = this.settings;
       // 方向自愈：应用启动 / Activity 重建 / 系统弹窗都可能把 user-rotation 或
       // 「忽略应用方向请求」改回去。一旦被改回去，横屏面板上的画面就会躺倒 90°
       // （用户说的「平板模式软件总是 90 度躺着」）。这里每轮巡检读一次真实状态，
       // 只有在**确实不一致**时才纠正，正常情况零写入。
       await this._healOrientation().catch(() => {});
-      const limit = (s.engine.idleShutdownMinutes || 0) * 60000;
-      if (!limit) return;
-      // 接管来的模拟器没有本地 proc 句柄，vmRunning 会是 false：
-      // 以前这里直接 return，导致容器永不回收。改成同时看 adb 是否在线。
-      if (!this.vmRunning) {
-        const online = await this.client().isOnline().catch(() => false);
-        if (!online) return;
-      }
-      if (this._activeApps.size > 0 || Date.now() - this.lastActivity < limit) return;
-      try {
-        const running = await this.client().runningPackages();
-        const alive = running.filter((p) => !/launcher|systemui|settings|inputmethod|android\.systemui/i.test(p));
-        if (alive.length === 0) await this.stop();
-        else this.lastActivity = Date.now();
-      } catch (_) { /* ignore */ }
+      await this._idleCheck().catch(() => {});
     }, 60000);
     if (this._watchdog.unref) this._watchdog.unref();
+  }
+
+  /**
+   * 空闲回收：没有打开着的应用窗口、且超过设定时间没有任何操作，就存快照并关掉虚拟机。
+   * @returns {Promise<string>} 判定结果（disabled / active / visible / recent / offline / busy / stopped）
+   */
+  async _idleCheck() {
+    const s = this.settings;
+    const limit = (s.engine.idleShutdownMinutes || 0) * 60000;
+    // 判据只用 ApkStart 自己掌握的事实（打开着的应用窗口 + 最近一次操作），
+    // 不再问「安卓里有没有前台 Activity」—— 见 container.idleDecision 的说明。
+    let visible = false;
+    try { visible = !!(this.hasVisibleSession && this.hasVisibleSession()); } catch (_) { /* ignore */ }
+    const verdict = container.idleDecision({
+      limitMs: limit, activeApps: this._activeApps.size, visible, lastActivity: this.lastActivity,
+    });
+    if (verdict === 'visible') { this.lastActivity = Date.now(); return verdict; }
+    if (verdict !== 'stop') return verdict;
+    // 正在装应用 / 正在开机 / 上一轮回收还没结束：不打断
+    if (this._idleStopping || this.installing || this.vmStarting) return 'busy';
+    // 接管来的模拟器没有本地 proc 句柄，vmRunning 会是 false：
+    // 以前这里直接 return，导致容器永不回收。改成同时看 adb 是否在线。
+    if (!this.vmRunning) {
+      const online = await this.client().isOnline().catch(() => false);
+      if (!online) return 'offline';
+    }
+    this._idleStopping = true;
+    try {
+      this.log(`idle for ${Math.round((Date.now() - this.lastActivity) / 60000)} min with no app window: stopping the runtime to free memory`);
+      // stop() 会先补存快照再关机：下次点开走快照恢复，而不是全量冷启动
+      await this.stop();
+      try { if (this.onIdleStop) this.onIdleStop(); } catch (_) { /* ignore */ }
+    } finally {
+      this._idleStopping = false;
+    }
+    return 'stopped';
   }
 
   get vmRunning() { return this.emulator.running() || !!(this.vmProc && !this.vmProc.killed); }
