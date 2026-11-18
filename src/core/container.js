@@ -205,7 +205,28 @@ function buildTombstoneCommands(pkgs = []) {
   return pkgs.filter((p) => SAFE_PKG.test(String(p))).map((p) => `am force-stop ${p}`);
 }
 
+/**
+ * 空闲回收的判定（纯函数，便于测试）。
+ *
+ * 以前的判据是「安卓里有没有前台 Activity」：只要有一个应用界面停在前台
+ * （关掉 ApkStart 的应用窗口并不会让它离开前台，快照恢复后它也还在），
+ * 空闲计时就被不断重置，虚拟机永远不回收 —— 实测一次开机预热后常驻了 12 小时，
+ * 3GB 的 guest 内存越用越满，只能重启电脑。
+ *
+ * 现在只看 ApkStart 自己知道的事实：有没有打开着的应用窗口、最近一次操作是什么时候。
+ *
+ * @returns {'disabled'|'active'|'visible'|'recent'|'stop'}
+ */
+function idleDecision({ limitMs = 0, activeApps = 0, visible = false, lastActivity = 0, now = Date.now() } = {}) {
+  if (!limitMs || limitMs <= 0) return 'disabled';
+  if (activeApps > 0) return 'active';
+  if (visible) return 'visible';
+  if (now - lastActivity < limitMs) return 'recent';
+  return 'stop';
+}
+
 module.exports = {
+  idleDecision,
   NEVER_TRIM, OPTIONAL_SYSTEM, SYSTEM_PREFIXES,
   isSystemPackage, buildSessionCommands, buildIdleCommands,
   buildRestoreCommands, nextSessionState, describeSession,

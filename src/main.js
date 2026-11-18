@@ -794,9 +794,17 @@ function createWindow({ show = true } = {}) {
   return mainWindow;
 }
 
+/** 开机自启时推迟的预热：用户第一次真的打开窗口时才执行（见 whenReady 里的说明） */
+let deferredPrewarm = null;
+/** 退出时是否保留虚拟机（更新 / 重启自身这类「马上还要用」的退出走这条） */
+let quitKeepRuntime = false;
+/** 正在退出收尾（存快照 + 关虚拟机）期间又被启动了一次：收尾完再把自己拉起来 */
+let pendingRelaunchArgs = null;
+
 function showWindow() {
   // 回到管理窗口 = 回到 ApkStart 自己的身份（不然任务栏会沿用上一个应用的图标）
   setAumid(APP_AUMID);
+  if (deferredPrewarm) { const run = deferredPrewarm; deferredPrewarm = null; run(); }
   if (!mainWindow) createWindow();
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
@@ -940,6 +948,16 @@ function buildTray() {
         label: displaySettings().mode === 'fullscreen' ? t('切回竖屏窗口') : t('全屏（自适应屏幕）'),
         click: () => { toggleDisplayMode(); },
       },
+      {
+        // 不想等空闲计时：手动把虚拟机关掉，内存立刻还给系统（会先存快照）
+        label: t('关闭安卓环境（释放内存）'),
+        click: async () => {
+          try { if (appWin && appWin.isOpen) await appWin.close({ keepApp: false }); } catch (_) { /* ignore */ }
+          appLog('tray: stop runtime requested');
+          await runtime.stop().catch(() => {});
+          refresh();
+        },
+      },
       { label: t('重建桌面/开始菜单快捷方式'), click: () => { installer.ensureShortcuts().catch(() => {}); } },
       { label: t('同步共享目录'), click: () => sharer.sync() },
       { label: t('设置'), click: () => { showWindow(); send('ui:navigate', 'settings'); } },
@@ -1063,7 +1081,7 @@ async function runUpdate() {
     sendProgress({ stage: 'apply', percent: 100, message: t('正在替换程序并重启…') });
     updater.apply(job);
     // 给界面一点时间显示「即将重启」，然后走正常退出流程（before-quit 会把模拟器窗口藏好）
-    setTimeout(() => { quitting = true; app.quit(); }, 900);
+    setTimeout(() => { quitting = true; quitKeepRuntime = true; app.quit(); }, 900);
     return { ok: true, version: info.version, mode: job.mode };
   } catch (e) {
     sendProgress({ stage: 'error', percent: 0, message: e.message });
@@ -2713,7 +2731,7 @@ function registerIpc() {
   ipcMain.handle('app:updateCancel', () => { updateBusy = false; return { ok: true }; });
 
   ipcMain.handle('app:restart', () => {
-    setTimeout(() => { quitting = true; app.quit(); }, 200);
+    setTimeout(() => { quitting = true; quitKeepRuntime = true; app.quit(); }, 200);
     return { ok: true };
   });
 }
@@ -2725,6 +2743,9 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', (_evt, argv) => {
+    // 正在退出收尾（存快照、关虚拟机，可能要几十秒）：这时去开应用只会撞上正在关机的
+    // 虚拟机。记下参数，收尾完成后把自己重新拉起来。
+    if (quitting) { pendingRelaunchArgs = argv.slice(1).filter((a) => !/^--(autostart|silent)$/.test(a)); return; }
     const args = parseArgs(argv);
     if (args.launch) { runLaunch(args.launch); return; }
     if (args.apk) { runInstall(args.apk).catch(() => {}); return; }
@@ -3032,10 +3053,13 @@ if (!gotLock) {
     // 打开 ApkStart 时就在后台把它引导好（窗口全程隐藏），之后点应用只剩一次 am start。
     // 只有「已经装过应用 + 有可用运行时」才预热，避免第一次使用/纯管理场景白占内存。
     const prewarmEnabled = store.getSettings().engine.prewarm !== false;
+    // 窗口可见性也算「正在用」：空闲回收不该在用户正看着应用窗口时触发
+    runtime.hasVisibleSession = () => !!(appWin && appWin.isOpen);
+    runtime.onIdleStop = () => { appLog('runtime stopped after idle timeout (memory released)'); };
     if (prewarmEnabled && !args.launch && store.getApps().length > 0) {
       // 1.2 秒就够窗口画完第一帧了。以前等 4 秒，用户这时已经点了应用，
       // 结果「点开」和「预热」抢同一个 AVD 锁，反而更慢。
-      setTimeout(async () => {
+      const runPrewarm = () => setTimeout(async () => {
         try {
           const env = await runtime.provisioner.checkEnv();
           if (!(env.adb.ok && env.emulator.ok && env.sysimg.ok)) {
@@ -3057,6 +3081,15 @@ if (!gotLock) {
           }
         } catch (e) { appLog(`prewarm error: ${e && e.message}`); /* 预热失败不影响后续正常打开 */ }
       }, 1200).unref?.();
+      // 随 Windows 开机自启（--autostart，窗口不显示）时不预热：用户这时并没有要用，
+      // 却会在每次开机后白白拉起一台 3GB 的虚拟机。推迟到他第一次打开窗口时再做；
+      // 直接点应用 / 双击 APK 走的是 ensure()，不依赖预热。
+      if (args.silent) {
+        deferredPrewarm = runPrewarm;
+        appLog('prewarm deferred: started with Windows, waiting until the window is first opened');
+      } else {
+        runPrewarm();
+      }
     } else {
       appLog(`prewarm off (enabled=${prewarmEnabled} launch=${!!args.launch} apps=${store.getApps().length})`);
     }
@@ -3085,7 +3118,7 @@ if (!gotLock) {
           appLog(`resuming pending update ${job.version} from cached payload`);
           send('update:progress', { stage: 'apply', percent: 100, message: t('正在完成上次未完成的更新…') });
           updater.apply(job);
-          setTimeout(() => { quitting = true; app.quit(); }, 900);
+          setTimeout(() => { quitting = true; quitKeepRuntime = true; app.quit(); }, 900);
         }
       } catch (e) { appLog(`resume check failed: ${e.message}`); }
       // 命中续做就不再并行发起新一轮查新版本；但不能用 return 跳出整个启动回调。
@@ -3206,6 +3239,38 @@ if (!gotLock) {
    * 日志里就是「运行时已退出（code=0）」紧跟「device 'emulator-5554' not found」。
    * owner.pid 由每次启动覆盖，所以谁最后启动谁才是主人。
    */
+  const ownsRuntime = () => {
+    try {
+      const owner = Number(String(fs.readFileSync(path.join(store.DATA_DIR, 'owner.pid'), 'utf8')).trim());
+      return !owner || owner === process.pid;
+    } catch (_) { return true; }
+  };
+  /**
+   * 退出 ApkStart 时把安卓虚拟机也关掉（先存快照）。
+   *
+   * 以前退出只做 dispose()，qemu 是 detached 的，会一直留在后台；而负责空闲回收的
+   * 看门狗跟着 ApkStart 一起没了，于是这台 3GB 的虚拟机再也没有人回收，直到重启电脑。
+   * 用户看到的就是「ApkStart 用久了占一大块内存，关掉也不还，只能重启」。
+   *
+   * 保留旧行为的出口：设置里的「退出后保留安卓环境」，以及更新 / 重启自身。
+   */
+  const stopRuntimeOnExit = async () => {
+    try {
+      if (!runtime || quitKeepRuntime) return;
+      if (store.getSettings().engine.keepRuntimeOnExit === true) return;
+      if (!ownsRuntime()) return;
+      const t0 = Date.now();
+      appLog('quit: stopping the Android runtime (snapshot + shutdown) to release memory');
+      // stop() 自身有上限（存快照 ≤60s + 等关机 ≤30s + 兜底强杀），这里再加一道总闸
+      await Promise.race([
+        runtime.stop().catch(() => {}),
+        new Promise((r) => setTimeout(r, 120000)),
+      ]);
+      appLog(`quit: runtime stop finished in ${Date.now() - t0}ms`);
+    } catch (e) {
+      appLog(`quit: runtime stop failed: ${e && e.message}`);
+    }
+  };
   const releaseRuntime = () => {
     let mine = true;
     try {
@@ -3231,12 +3296,22 @@ if (!gotLock) {
       sharer?.stop();
       notifier?.stop();
       try { appWin?.close({ keepApp: true }); } catch (_) { /* ignore */ }
-      const finish = () => {
+      // 关虚拟机要存快照，可能要几十秒：用户点了「退出」，界面必须立刻消失，
+      // 收尾在后台做完再真正结束进程。
+      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide(); } catch (_) { /* ignore */ }
+      try { if (tray && !quitKeepRuntime) tray.setToolTip(t('ApkStart 正在退出：保存快照并关闭安卓环境…')); } catch (_) { /* ignore */ }
+      const finish = async () => {
+        // 先关虚拟机再丢掉窗口代理：关机期间模拟器窗口仍要被压住，不能闪出来
+        await stopRuntimeOnExit();
         try { winAgent?.dispose(); } catch (_) { /* ignore */ }
         try { wheelRouter?.dispose(); } catch (_) { /* ignore */ }
         releaseRuntime();
         // 隐藏的图标解码窗口也算一个窗口，不关掉会让 window-all-closed 永远不触发
         try { if (decodeWindow && !decodeWindow.isDestroyed()) decodeWindow.destroy(); } catch (_) { /* ignore */ }
+        if (pendingRelaunchArgs) {
+          appLog(`relaunching after quit cleanup: ${pendingRelaunchArgs.join(' ')}`);
+          try { app.relaunch({ args: pendingRelaunchArgs }); } catch (_) { /* ignore */ }
+        }
         app.quit();
       };
       setTimeout(finish, 400);

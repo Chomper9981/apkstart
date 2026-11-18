@@ -1089,6 +1089,7 @@ function fillSettings(s) {
   $('setAudio').checked = s.engine.audio !== false;
   $('setLiteMode').checked = s.engine.liteMode !== false;
   $('setPrewarm').checked = s.engine.prewarm !== false;
+  if ($('setKeepRuntimeOnExit')) $('setKeepRuntimeOnExit').checked = s.engine.keepRuntimeOnExit === true;
   $('setPriorityMode').value = ['performance', 'game'].includes(s.engine.priorityMode)
     ? s.engine.priorityMode : 'balanced';
   $('setDeepTrim').checked = !!s.engine.deepTrim;
@@ -1800,6 +1801,9 @@ function bindSettings() {
   $('setAudio').addEventListener('change', (e) => save({ engine: { audio: e.target.checked } }));
   $('setLiteMode').addEventListener('change', (e) => save({ engine: { liteMode: e.target.checked } }));
   $('setPrewarm').addEventListener('change', (e) => save({ engine: { prewarm: e.target.checked } }));
+  if ($('setKeepRuntimeOnExit')) {
+    $('setKeepRuntimeOnExit').addEventListener('change', (e) => save({ engine: { keepRuntimeOnExit: e.target.checked } }));
+  }
   $('setPriorityMode').addEventListener('change', (e) => save({ engine: { priorityMode: e.target.value } }));
   const savePointer = async (patch) => {
     await save({ engine: patch });
