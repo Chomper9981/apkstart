@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const store = require('./store');
 
-function bootstrapBundledRuntime({ execPath = process.execPath, resourcesPath = process.resourcesPath } = {}) {
+function bootstrapBundledRuntime({ execPath = process.execPath, resourcesPath = process.resourcesPath, log = () => {} } = {}) {
   let bundledRuntimeDir = null;
   try {
     const exeDir = path.dirname(execPath);
@@ -54,6 +54,19 @@ function bootstrapBundledRuntime({ execPath = process.execPath, resourcesPath = 
     // 就会一直走「缺组件」的部署向导。现在只要当前运行时目录里没有 emulator 就接管。
     const explicit = String(s.runtime.dir || '').trim();
     const current = explicit || path.join(store.DATA_DIR, 'runtime');
+    // 「另一个安装包的运行时」：路径是 <某目录>/resources/runtime，但不在本次 EXE 的目录树里。
+    // 这只可能来自「解压了新版便携包、settings.json 还记着旧包路径」——
+    // 实测后果很隐蔽：新包启动，实际跑的是上个版本的 emulator/镜像/快照，
+    // 用户升级后仍然卡顿、方向参数还是旧的，甚至旧包一删就彻底起不来。
+    // 用户自己挑的目录（D:\ApkStartRuntime 之类）不会被这条规则误伤。
+    const looksForeignBundle = /[\\/]resources[\\/]runtime$/i.test(current)
+      && !path.resolve(current).toLowerCase().startsWith(path.resolve(exeDir).toLowerCase());
+    if (looksForeignBundle && fs.existsSync(path.join(bundled, 'emulator', 'emulator.exe'))) {
+      store.saveSettings({ runtime: { dir: bundled } });
+      bundledRuntimeDir = bundled;
+      try { log(`运行时目录指向别的安装包（${current}），改用随包内置运行时 ${bundled}`); } catch (_) { /* ignore */ }
+      return bundledRuntimeDir;
+    }
     const currentExe = path.join(current, 'emulator', 'emulator.exe');
     // 便携版被移动/升级（解压到新目录）后，settings 里记的还是旧路径：
     // 必须只认「本次 EXE 所在目录下的 runtime」，否则会一直用旧包里的组件

@@ -16,6 +16,7 @@ const path = require('path');
 const store = require('./store');
 const { Provisioner } = require('./provision');
 const doctor = require('./doctor');
+const drivers = require('./drivers');
 const userdata = require('./userdata');
 const { t, N_ } = require('../i18n');
 
@@ -61,6 +62,12 @@ class EmulatorEngine {
     this.attempts = [];
     this.lastDiagnosis = null;
     this.lastExitCode = null;
+    /**
+     * 本次开机生效的驱动（兼容补丁）效果，以及命中的驱动清单。
+     * 由 start() 里的 _resolveDrivers() 填；buildArgs / env / ensureAvd 只读它。
+     */
+    this._driverEffect = null;
+    this._driversApplied = [];
     // 快照的 ram.bin ≈ 分配给虚拟机的内存（2-4GB）。
     // 冷启动本来就快的机器不该为它付出几个 GB 的磁盘，只在「真慢」时才保存。
     this.snapshotWorthSaving = null;
@@ -299,6 +306,90 @@ class EmulatorEngine {
   }
 
   /**
+   * 给界面/诊断用的驱动报告：这次开机用了哪些、跳过了哪些、为什么。
+   * @returns {{ applied:Array, effect:object|null, errors:Array, host:object|null }}
+   */
+  driverReport() {
+    const pick = (d) => ({
+      id: d.id, name: d.name, version: d.version, author: d.author || '',
+      description: d.description || '', priority: d.priority, hits: d.hits || [],
+      dir: d.dir || '', file: d.file || '',
+    });
+    return {
+      applied: (this._driversApplied || []).map(pick),
+      effect: this._driverEffect ? {
+        gpuMode: this._driverEffect.gpuMode,
+        forceTcg: this._driverEffect.forceTcg,
+        notes: this._driverEffect.notes || [],
+        ini: this._driverEffect.ini || {},
+        env: this._driverEffect.env || {},
+        args: (this._driverEffect.args || []).map((a) => (a.value ? `${a.flag}=${a.value}` : a.flag)),
+      } : null,
+      errors: this._driverErrors || [],
+      host: this._driverHost || null,
+    };
+  }
+
+  /**
+   * 把驱动声明的 config.ini 覆盖项套到默认配置上。
+   * 已存在的键就地替换（不产生重复行），不存在的追加在后面。
+   * 只处理 drivers.js 白名单里的键，非法键在校验阶段就被拒了。
+   */
+  _iniWithDrivers(text) {
+    const over = (this._driverEffect && this._driverEffect.ini) || {};
+    const keys = Object.keys(over);
+    if (!keys.length) return text;
+    const seen = new Set();
+    const out = String(text).split('\n').map((line) => {
+      const m = /^([A-Za-z0-9_.]+)=/.exec(line);
+      if (!m || !(m[1] in over)) return line;
+      seen.add(m[1]);
+      return `${m[1]}=${over[m[1]]}`;
+    });
+    for (const k of keys) if (!seen.has(k)) out.push(`${k}=${over[k]}`);
+    return out.join('\n');
+  }
+
+  /**
+   * 读一遍驱动目录，挑出匹配这台机器的，存成本次开机的效果。
+   *
+   * 目录顺序即优先级：内置示例（只读，默认 enabled:false）在前，用户驱动在后，
+   * 同 id 时用户目录覆盖内置 —— 用户改了示例就能直接生效，不用改安装目录。
+   *
+   * @returns {{ applied:Array, skipped:Array, errors:Array } | null}
+   */
+  _resolveDrivers({ accel, emulatorVersion }) {
+    const s = this.settings || {};
+    const disabled = (s.drivers && s.drivers.disabled) || [];
+    const state = (s.drivers && s.drivers.state) || {};
+    let gpuName = '';
+    let osBuild = 0;
+    try {
+      const release = require('os').release() || '';
+      const m = /(\d+)\s*$/.exec(release);
+      osBuild = m ? Number(m[1]) : 0;
+    } catch (_) { /* 拿不到就当 0，匹配条件里带 osBuild 的驱动不会生效 */ }
+    const host = drivers.hostContext({
+      info: { ...doctor.hostInfo(), cpuVendor: (require('os').cpus() || [])[0]?.model || '' },
+      gpuVendor: doctor.detectGpuVendor(),
+      gpuName,
+      osBuild,
+      accel: accel && accel.ok ? (accel.kind || 'whpx') : 'none',
+      emulatorVersion,
+    });
+    const loaded = drivers.loadAll([
+      drivers.bundledDir(this.appRoot),
+      drivers.userDir(store),
+    ]);
+    const r = drivers.resolve({ drivers: loaded.drivers, host, disabled, state });
+    this._driverEffect = r.effect;
+    this._driversApplied = r.applied;
+    this._driverErrors = loaded.errors;
+    this._driverHost = host;
+    return { ...r, errors: loaded.errors, host };
+  }
+
+  /**
    * 准备 AVD：写 config.ini。每次启动按当前自动配置重写，保证降级重试即时生效。
    */
   ensureAvd({
@@ -413,7 +504,7 @@ class EmulatorEngine {
       // wm density（改 smallestWidth），不需要也不允许传感器参与。
       'hw.sensors.orientation=no',
     ].join('\n') + '\n';
-    fs.writeFileSync(cfgPath, cfg);
+    fs.writeFileSync(cfgPath, this._iniWithDrivers(cfg));
 
     // /data 分区必须先「真的能用」，否则后面一切都是白等（见 ensureDataPartition 注释）
     const data = this.ensureDataPartition(avdDir, dataMB);
@@ -528,6 +619,8 @@ class EmulatorEngine {
       ANDROID_ADB_SERVER_PORT: adbPort,
       ANDROID_EMULATOR_USE_SYSTEM_LIBS: '',
       ...(plan.accel === 'off' ? { ANDROID_I_WANT_MY_TCG: 'yes' } : {}),
+      // 驱动声明的环境变量：只放行 ANDROID_/QEMU_/LIBGL_/MESA_/EMUGL_ 前缀（见 drivers.js）
+      ...((this._driverEffect && this._driverEffect.env) || {}),
     };
   }
 
@@ -546,6 +639,12 @@ class EmulatorEngine {
     gpu = 'software', memoryMB = 2048, cores = 2,
     snapshot = true, wipe = false, lcd = null,
   } = {}) {
+    // 驱动可以固定渲染后端 / 强制软件模拟。放在最前面算进 gpu/accel，
+    // 这样后面所有逻辑（-accel off、config.ini 的 hw.gpu.mode）都跟着它走。
+    const eff = this._driverEffect || null;
+    const drvGpu = eff ? drivers.gpuModeToArg(eff.gpuMode) : '';
+    if (drvGpu) gpu = drvGpu;
+    if (eff && eff.forceTcg) accel = 'off';
     const args = [
       '-avd', AVD_NAME,
       '-port', String(port),
@@ -557,6 +656,12 @@ class EmulatorEngine {
       // 主线程被卡住、永远不开机（日志表现为 Showing crashdialog to get consent）。
       '-crash-report-mode', 'disabled',
       '-gpu', gpu,
+      // AMD + emulator 37.x：host 后端的 Vulkan 初始化会失败，进程起来十几秒
+      // 后直接 exit 1，于是被记成「host 不可用」永久退回 swangle（软件渲染），
+      // 视频/滑动全都掉帧。关掉 Vulkan 让它走 GL，才能真的吃到硬件加速。
+      // 软件后端本来就不用 Vulkan，加上只会多一层不确定性，所以只对 host 生效。
+      ...(gpu === 'host' && process.platform === 'win32' && doctor.detectGpuVendor() === 'amd'
+        ? ['-feature', '-Vulkan'] : []),
       '-memory', String(memoryMB),
       '-cores', String(cores),
     ];
@@ -623,6 +728,13 @@ class EmulatorEngine {
     }
     if (wipe) args.push('-wipe-data');
     if (accel === 'off') args.push('-accel', 'off');
+    // 驱动声明的其它参数：-gpu / -accel 已经由上面的 gpu/accel 统一处理，这里跳过，
+    // 避免同一个参数出现两次（emulator 对重复参数的行为在不同版本上不一致）。
+    for (const a of ((eff && eff.args) || [])) {
+      if (a.flag === '-gpu' || a.flag === '-accel') continue;
+      if (a.value === '') args.push(a.flag);
+      else args.push(a.flag, a.value);
+    }
     return args;
   }
 
@@ -716,22 +828,68 @@ class EmulatorEngine {
     const img = path.join(dir, 'userdata-qemu.img');
     let bytes = 0;
     try { bytes = fs.statSync(img).size; } catch (_) { /* 还没建 */ }
+    let fsBytesNow = 0;
+    try { fsBytesNow = userdata.fsBytes(img); } catch (_) { /* 还没建或损坏 */ }
+    const configuredGB = Number(this.settings?.engine?.dataPartitionGB || 0);
+    const fsGB = fsBytesNow ? Number((fsBytesNow / 1073741824).toFixed(1)) : 0;
     return {
       avdDir: dir,
       imageBytes: bytes,
       imageGB: bytes ? Number((bytes / 1073741824).toFixed(1)) : 0,
-      configuredGB: Number(this.settings?.engine?.dataPartitionGB || 0),
+      // 文件系统实际大小（≠ 镜像文件大小）：扩了镜像但 resize2fs 没到位时这两个数会不一样
+      fsGB,
+      configuredGB,
+      // 用户设了目标、但文件系统还没长到目标
+      pendingGB: configuredGB && fsGB ? Math.max(0, configuredGB - fsGB) : 0,
+      // quickboot 会给 userdata 建一层 qcow2 覆盖层，guest 看到的是它，不是底座镜像
+      overlay: this._hasDataOverlay(img),
     };
+  }
+
+  /** userdata 是否被 quickboot 的 qcow2 覆盖层接管（有它就只能重置，不能就地扩容） */
+  _hasDataOverlay(img) {
+    try { return fs.existsSync(`${img}.qcow2`); } catch (_) { return false; }
   }
 
   /**
    * 立即把 /data 分区扩容到指定大小（必须保证模拟器已停止，否则镜像被占用）。
-   * 走的是 ensureDataPartition 的就地扩容路径：qemu-img resize + resize2fs，
-   * 不重建、不丢已装应用与存档。
+   *
+   * 两种路径，取舍是实测出来的：
+   *  - 没有 quickboot 覆盖层：就地扩（qemu-img resize + resize2fs），不丢已装应用；
+   *  - 有覆盖层：guest 真正挂载的是 `userdata-qemu.img.qcow2`，底座扩到 8GB、
+   *    文件系统也长到 8GB，guest 里 `df /data` 依旧是 5.7GB（覆盖层还是旧大小），
+   *    而覆盖层里的文件系统没有 root 权限改不了。这种时候必须如实返回「需要重置」，
+   *    不能再像以前那样返回成功 —— 用户会以为扩好了，装 50GB 游戏依旧半路失败。
    */
   resizeDataPartition(dataMB) {
     const dir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`);
-    return this.ensureDataPartition(dir, dataMB);
+    const img = path.join(dir, 'userdata-qemu.img');
+    const wantGB = Math.max(1, Math.round(Number(dataMB || 0) / 1024));
+    if (this._hasDataOverlay(img)) {
+      return {
+        ok: false,
+        needsReset: true,
+        fsGB: this.dataInfo().fsGB,
+        error: t('安卓正在用快速启动的差量盘，就地扩容改不到它（目标 {wantGB} GB）。', { wantGB })
+          + t('需要「重置安卓数据」后按新容量重建 /data —— 已装应用和存档会被清空，请先确认。'),
+      };
+    }
+    const r = this.ensureDataPartition(dir, dataMB);
+    // ensureDataPartition 在 resize2fs 失败时会返回 ok:false；再核一次文件系统大小，
+    // 防止「文件撑开了、文件系统没长」被当成功（用户看到的就是装游戏说空间不足）。
+    let fsAfter = 0;
+    try { fsAfter = userdata.fsBytes(img); } catch (_) { /* ignore */ }
+    const wantBytes = Math.max(1024, Math.round(Number(dataMB || 0))) * 1048576;
+    if (r && r.ok && fsAfter < wantBytes * 0.95) {
+      return {
+        ok: false,
+        ...r,
+        fsGB: Number((fsAfter / 1073741824).toFixed(1)),
+        error: t('镜像已扩到 {wantGB} GB，但文件系统只到 {v1} GB（resize2fs 没成功）。', { wantGB, v1: (fsAfter / 1073741824).toFixed(1) })
+          + t('可以再点一次「立即扩容」，或清理磁盘后重试。'),
+      };
+    }
+    return r;
   }
 
   /**
@@ -1094,13 +1252,45 @@ class EmulatorEngine {
     const emuVersion = verInfo.version || '';
     this._emuVersion = emuVersion;
 
+    // 驱动（兼容补丁）：先看清这台机器是什么样，再看有没有人给它写过补丁。
+    // 这一步只读 JSON，不执行任何代码；匹配不上就是空效果，行为和以前完全一致。
+    let drv = { applied: [], skipped: [], errors: [], effect: null };
+    try {
+      drv = this._resolveDrivers({ accel: accelInfo, emulatorVersion: emuVersion });
+    } catch (e) {
+      this.log(`驱动加载失败：${e.message}`);
+      onLog(t('驱动加载失败（已忽略，按默认参数启动）：{message}', { message: e.message }));
+    }
+    if (drv.applied.length) {
+      onLog(t('已应用驱动：{list}', { list: drv.applied.map((d) => `${d.name} v${d.version}`).join(t('、')) }));
+      for (const n of (this._driverEffect.notes || []).slice(0, 4)) onLog(`· ${n}`);
+    } else {
+      onLog(t('未匹配到任何驱动，按默认参数启动'));
+    }
+    if (drv.errors && drv.errors.length) {
+      onLog(t('有 {length} 个驱动文件没加载成功（设置 → 驱动 里能看到原因）', { length: drv.errors.length }));
+    }
+
     // 与设置页 / 诊断报告共用同一个入口，保证「显示的」就是「实跑的」
     const profile = doctor.autoProfile({
       settings: s, accel: accelInfo, emulatorVersion: emuVersion, diskMB,
       port: startPort, adbPort,
     });
     this.profile = profile;
-    const variants = doctor.planVariants(profile).slice(0, maxAttempts);
+    let variants = doctor.planVariants(profile).slice(0, maxAttempts);
+    // 驱动指定了渲染后端 / 要求软件模拟时，每一轮都按它来：
+    // 用户装驱动的目的就是「这台机器只能用这一档」，继续先试崩过的后端只会白等。
+    if (drv.applied.length && this._driverEffect) {
+      const gpuFixed = drivers.gpuModeToArg(this._driverEffect.gpuMode);
+      if (gpuFixed) {
+        variants = variants.map((v) => ({ ...v, gpu: gpuFixed }));
+        onLog(t('驱动把渲染后端固定为 {gpuFixed}', { gpuFixed }));
+      }
+      if (this._driverEffect.forceTcg) {
+        variants = variants.map((v) => ({ ...v, accel: 'off', label: t('{gpu} / 驱动要求软件模拟', { gpu: v.gpu }) }));
+        onLog(t('驱动要求关闭硬件加速（走软件模拟）'));
+      }
+    }
 
     // 记住「上次拉起就崩」的 GPU 后端，下次把它排到最后。
     // 实测：AMD Radeon 780M 上 `-gpu host` 能通过 emulator 自己的硬件检查，
@@ -1109,7 +1299,14 @@ class EmulatorEngine {
     // 升级运行时后自动重新给它一次机会。
     const badGpuKey = this.settings.engine.badGpu || '';
     const [badVer, badGpu] = badGpuKey.includes('|') ? badGpuKey.split('|') : ['', ''];
-    if (badGpu && badVer === emuVersion) {
+    // 关掉 Vulkan 之后 host 有机会真的可用：每个 emulator 版本重试一次，
+    // 免得老记录把用户永久钉在软件渲染上（那是「一直卡」的根因之一）。
+    const vulkanRetried = String(this.settings.engine.badGpuVulkanTried || '');
+    const retryHostWithoutVulkan = badGpu === 'host' && badVer === emuVersion && vulkanRetried !== emuVersion;
+    if (retryHostWithoutVulkan) {
+      store.saveSettings({ engine: { badGpu: '', badGpuVulkanTried: emuVersion } });
+      onLog(t('上次 host 渲染崩溃疑似 Vulkan 导致，本次以 -feature -Vulkan 重试硬件加速'));
+    } else if (badGpu && badVer === emuVersion) {
       const rank = (v) => (v.gpu === badGpu ? 1 : 0);
       variants.sort((a, b) => rank(a) - rank(b));
       if (variants[0] && variants[0].gpu === badGpu && variants.length > 1) {
@@ -1120,6 +1317,7 @@ class EmulatorEngine {
     const logFile = path.join(store.DATA_DIR, 'logs', 'emulator.log');
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
     this._logWrite(logFile, `\n\n=== ${new Date().toISOString()} START ${doctor.describeProfile(profile)} ===\n`);
+    this._logWrite(logFile, `drivers: ${drv.applied.length ? drv.applied.map((d) => `${d.id}@${d.version}`).join(', ') : '(none)'}\n`);
 
     // 屏幕规格在整个启动过程中保持一致，否则每次重试都换分辨率会狂清快照。
     // 分辨率来自 doctor 的 profile（设置里可改「画质」），auto 时按加速状态选。
@@ -1275,7 +1473,9 @@ class EmulatorEngine {
       this.lastDiagnosis = d;
       lastError = fatal ? t('{title}：{hint}', { title: d.title, hint: d.hint }) : t('开机超时（可能是首次引导较慢或硬件加速未生效）');
       onLog(t('{reason}，自动换一组参数重试…', { reason: lastError }));
-      this._noteGpuFailure(plan);
+      // 授权对话框卡住不是渲染后端的问题，别把当前 GPU 记进「启动即崩」黑名单，
+      // 否则下次启动会无缘无故跳过用户机器本来能用的后端。
+      if (d.code !== 'ADB_UNAUTHORIZED') this._noteGpuFailure(plan);
       // eslint-disable-next-line no-await-in-loop
       await this.killAttempt();
     }
@@ -1362,11 +1562,18 @@ class EmulatorEngine {
     }
     this.cancelSnapshotSave();
     const serial = this.serial;
-    if (adbPath && this.snapshotWorthSaving !== false) {
-      // 关机前补存一次：空闲路径没来得及存（比如用户装完应用马上退出）时，
-      // 下一次开机仍然能走快照恢复，而不是重新冷启动。
+    // 关机前先判断 guest 是否健康，只在这一次判断里问一遍 adb：
+    //  - 健康 → 补存一次快照（空闲路径没来得及存时，下次仍能秒进）；
+    //  - 不健康（adb 卡在 unauthorized / 没开机完成）→ 不存，并且**在退出后作废快照**：
+    //    `adb emu kill` 会让 emulator 自己按 quickboot 存一份内存状态，那份同样会
+    //    冻结未授权状态。不在这里清掉，下次恢复又是一份「开机必超时」的毒快照。
+    const healthy = adbPath ? await this._adbGuestHealthy(adbPath) : false;
+    if (adbPath && this.snapshotWorthSaving !== false && healthy) {
       // 3GB 内存写盘要几秒到二十几秒，超时给足，别让快照写一半就被 kill 掉。
       await this._saveViaAdb(adbPath, { timeout: 60000 });
+    }
+    if (!healthy && this.snapshotWorthSaving !== false) {
+      this.log('关机时 guest 未授权/未就绪：将作废快照，下次冷启动重新注入调试授权');
     }
     if (adbPath) {
       await new Promise((resolve) => {
@@ -1387,6 +1594,11 @@ class EmulatorEngine {
     // 关干净了就把启动器句柄丢掉。留着它会让 running() 永远返回 true、
     // start() 以为还能复用（见 start() 里的注释）。
     this.proc = null;
+    // 进程已退出，这时再作废它可能在退出时自动存的毒快照。顺序很重要：必须放在
+    // emu kill + 端口关闭之后，否则它会把刚删的快照又写回来。
+    if (!healthy && this.snapshotWorthSaving !== false) {
+      try { this.invalidateSnapshot(); } catch (_) { /* ignore */ }
+    }
     return true;
   }
 
@@ -1426,8 +1638,35 @@ class EmulatorEngine {
     });
   }
 
-  /** 用 adb 触发一次快照保存（失败返回 false，调用方决定要不要再试） */
-  _saveViaAdb(adbPath, { timeout = 45000 } = {}) {
+  /**
+   * guest 是否处于「可以安全存快照」的健康状态：adb authorized + boot 完成。
+   * 冷启动时若「允许 USB 调试吗？」对话框还挂着，state 是 unauthorized —— 这时存下
+   * 内存 + 磁盘，guest 里就没有 host 的 adbkey.pub，下次恢复还是 unauthorized，
+   * 每轮探测的 shell 都抛异常，干等 240s 还被误诊成显卡/虚拟化问题。
+   */
+  async _adbGuestHealthy(adbPath) {
+    if (!adbPath) return false;
+    try {
+      const { AdbClient } = require('./adb');
+      const probe = new AdbClient({ adbPath, serial: this.serial });
+      const state = await probe.deviceState();
+      const out = await probe.shell('getprop sys.boot_completed', { timeout: 6000 }).catch(() => '');
+      return state === 'device' && String(out).trim() === '1';
+    } catch (_) {
+      return false; // 读不到就按不健康处理
+    }
+  }
+
+  /**
+   * 用 adb 触发一次快照保存（失败返回 false，调用方决定要不要再试）。
+   * 只有 guest 健康时才存，宁可下次冷启动 20 多秒，也不能存一份「开机必失败」的毒快照。
+   */
+  async _saveViaAdb(adbPath, { timeout = 45000 } = {}) {
+    if (!adbPath) return false;
+    if (!(await this._adbGuestHealthy(adbPath))) {
+      this.log('跳过快照保存：guest 未授权或未开机完成（避免存入未授权的毒快照）');
+      return false;
+    }
     return new Promise((resolve) => {
       execFile(adbPath, ['-s', this.serial, 'emu', 'avd', 'snapshot', 'save', SNAPSHOT_NAME],
         { timeout, windowsHide: true }, (err) => resolve(!err));

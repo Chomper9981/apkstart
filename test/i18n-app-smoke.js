@@ -135,7 +135,9 @@ async function main() {
   });
 
   console.log('\n[upgrade from a Chinese-only version]');
-  const oldSettings = { engine: { memoryMB: 4096, resourceMode: 'smooth', prewarm: false }, runtime: { mirrorPrefix: 'https://mirror.example/' }, autoDeploy: false };
+  const oldSettings = { engine: { memoryMB: 4096, resourceMode: 'smooth', prewarm: false }, runtime: { mirrorPrefix: 'https://mirror.example/' }, autoDeploy: false, createShortcutOnInstall: false };
+  // createShortcutOnInstall: false keeps the app from (re)creating real Desktop / Start Menu
+  // shortcuts for the fixture app at startup: a test must not write outside its own data dir.
   const apps = { apps: [{ package: 'com.example.demo', label: '示例应用', versionName: '1.0' }] };
   const up = dataDir('upgrade', { 'settings.json': oldSettings, 'apps.json': apps });
   // Compare content, not bytes: the app itself may re-serialise apps.json (formatting only).
