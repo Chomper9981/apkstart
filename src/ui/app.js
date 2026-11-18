@@ -275,8 +275,7 @@ async function refreshStatus() {
 function showSetup(on) {
   if (!on) { $('setupGuide').hidden = true; return; }
   openSettings().then(() => {
-    const box = $('runtimeGroup');
-    if (box) box.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    focusGroup($('runtimeGroup'));
   }).catch(() => {});
 }
 
@@ -615,6 +614,7 @@ const MENU_ITEMS = [
   // 应用一起来就关不掉，只能退到托盘退出整个 ApkStart。
   { key: 'stop', label: t('关闭应用'), onlyRunning: true },
   { key: 'shortcut', label: t('创建桌面快捷方式') },
+  { key: 'orientation', label: t('横屏 / 竖屏') },
   { key: 'pin', label: t('固定到顶部') },
   { key: 'keymap', label: t('按键映射…') },
   { divider: true },
@@ -631,7 +631,11 @@ function showMenu(x, y, pkg) {
   const items = MENU_ITEMS.filter((it) => !it.onlyRunning || (app && app.running));
   menu.innerHTML = items.map((it) => {
     if (it.divider) return '<div class="divider"></div>';
-    const label = it.key === 'pin' ? (app && app.pinned ? t('取消固定') : t('固定到顶部')) : it.label;
+    const label = it.key === 'pin' ? (app && app.pinned ? t('取消固定') : t('固定到顶部'))
+      : (it.key === 'orientation'
+        ? (app && app.orientationOverride === 'landscape' ? t('竖屏启动（当前横屏）')
+          : (app && app.orientationOverride === 'portrait' ? t('横屏启动（当前竖屏）') : t('设为横屏启动')))
+        : it.label);
     return `<div class="item ${it.danger ? 'danger' : ''}" data-key="${it.key}" data-act="${it.key}">
       <span>${esc(label)}</span>${it.kbd ? `<span class="k">${it.kbd}</span>` : ''}
     </div>`;
@@ -710,6 +714,24 @@ async function handleMenu(act) {
       return refreshApps();
     }
     case 'shortcut': return createShortcut(pkg);
+    case 'orientation': {
+      // 三态循环：跟随应用 → 横屏 → 竖屏 → 跟随应用
+      // 这样红果这类被清单判成竖屏的应用，用户点一下就能强制横屏并记住。
+      const cur = app.orientationOverride;
+      const next = cur === 'landscape' ? 'portrait' : (cur === 'portrait' ? null : 'landscape');
+      try {
+        const r = await api.setAppOrientation(pkg, next);
+        const txt = next === 'landscape' ? t('横屏启动') : (next === 'portrait' ? t('竖屏启动') : t('跟随应用'));
+        toast({ title: t('已设为{txt}', { txt }), body: t('下次打开该应用时生效，无需重启整个环境。'), type: 'ok' });
+        if (r && typeof r.landscape === 'boolean' && state.apps) {
+          const rec = state.apps.find((a) => a.package === pkg);
+          if (rec) rec.orientationOverride = next;
+        }
+      } catch (e) {
+        toast({ title: t('设置方向失败'), body: e.message, type: 'error' });
+      }
+      return refreshApps();
+    }
     case 'pin': return api.pin(pkg, !app.pinned).then(refreshApps);
     case 'keymap': return showKeymapPicker(pkg, app.label);
     case 'reveal': return api.revealApk(pkg);
@@ -828,20 +850,218 @@ function bindAndroid() {
   $('btnAndroidApps').addEventListener('click', () => open('apps'));
 }
 
-/** 按当前底座的 id 决定哪些字段要露出来（自带 = 镜像/内存那些，第三方 = 它自己的路径） */
+/** 设置页字段同步：只剩自带运行时，所有资源项都露出来，不再按底座切换 */
 function syncBackendFields() {
-  const mode = $('setEngineMode') ? $('setEngineMode').value : 'builtin';
-  const builtin = mode === 'builtin' || mode === 'attach';
-  const show = (id, on) => { const el = $(id); if (el && el.closest('.field')) el.closest('.field').hidden = !on; };
-  show('setMumuPath', mode === 'mumu');
-  show('setFydeosHost', mode === 'fydeos');
-  show('setSystemImage', builtin);
-  show('setMemory', builtin);
-  show('setCores', builtin);
-  show('setCompat', builtin);
-  show('compatInstallField', builtin && !$('compatInstallField').hidden);
-  show('setIdle', true);
-  show('setDevice', mode === 'attach');
+  const perf = $('perfGroup');
+  if (perf) perf.hidden = false;
+  refreshResources();
+}
+
+/** 本机资源上限 + 当前分配（设置页里那几行灰字） */
+async function refreshResources() {
+  const bNote = $('builtinResNote');
+  if (!bNote) return;
+  const gb = (mb) => (Number(mb) > 0 ? `${Math.round(Number(mb) / 1024)} GB` : t('未知'));
+  const r = await api.resources().catch(() => null);
+  if (!r || r.ok === false) {
+    bNote.textContent = (r && (r.note || r.error)) || t('暂时读不到资源分配信息');
+    return;
+  }
+  const host = r.host || {};
+  const lim = r.limits || {};
+  const free = Number(r.freeMB) || Number((r.current && r.current.freeMB) || 0);
+  bNote.textContent = t('本机 {v1} 内存 / {cores} 核；', { v1: gb(host.totalMB), cores: host.cores })
+    + t('内存最多可分 {v1}，核心最多 {v2} 个（各留 1/4 内存与 1 核给 Windows）。', { v1: gb(lim.maxMB), v2: Math.max(1, (host.cores || 1) - 1) })
+    + t('数据分区上限 {gb} GB', { gb: lim.maxGB || 0 })
+    + (free ? t('（所在磁盘剩余 {free} GB）', { free: (free / 1024).toFixed(1) }) : '') + t('。')
+    + (r.verdict && r.verdict.note ? ` ${r.verdict.note}` : '');
+}
+
+/** 本机体检：渲染报告（每条带等级点和可执行动作） */
+function renderPreflight(res) {
+  const list = $('preflightList');
+  const sum = $('preflightSummary');
+  const applyBtn = $('btnPreflightApply');
+  if (!list) return;
+  list.textContent = '';
+  if (!res || !res.report) {
+    if (sum) sum.textContent = (res && res.error) || t('体检没有返回结果，请重试');
+    return;
+  }
+  const { report, edition } = res;
+  for (const it of report.items) {
+    const item = document.createElement('div');
+    item.className = 'pf-item';
+    const head = document.createElement('div');
+    head.className = 'pf-head';
+    const dot = document.createElement('span');
+    dot.className = `pf-dot ${it.level}`;
+    const title = document.createElement('span');
+    title.className = 'pf-title';
+    title.textContent = it.title;
+    head.append(dot, title);
+    item.append(head);
+    if (it.detail) {
+      const d = document.createElement('div');
+      d.className = 'pf-detail';
+      d.textContent = it.detail;
+      item.append(d);
+    }
+    if (it.action && it.action.kind === 'elevate') {
+      const wrap = document.createElement('div');
+      wrap.className = 'pf-action';
+      const btn = document.createElement('button');
+      btn.className = 'btn ghost sm';
+      btn.textContent = it.action.label;
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = t('正在处理…');
+        let r = null;
+        if (it.action.id === 'accel') r = await api.enableAccel().catch(() => null);
+        else r = await api.enableVirtualization().catch(() => null);
+        btn.disabled = false;
+        btn.textContent = old;
+        if (!r) { toast({ type: 'error', title: t('操作没有完成'), body: t('可以稍后重试，或手动按提示操作') }); return; }
+        if (r.cancelled) toast({ type: 'warn', title: t('已取消'), body: t('没有修改系统设置') });
+        else if (r.ok || r.already) {
+          const reboot = r.restartNeeded === true;
+          toast({
+            type: 'ok',
+            title: r.already ? t('硬件加速已经可用') : (reboot ? t('已提交，需要重启') : t('已生效')),
+            body: r.already ? '' : (reboot ? t('重启电脑后硬件加速才会生效，回来点「开始体检」确认') : t('可以点「开始体检」确认结果')),
+          });
+          if (r.already || !reboot) setTimeout(() => runPreflight().catch(() => {}), 1200);
+        } else {
+          toast({ type: 'error', title: t('没能自动完成'), body: (r.error || r.note || t('请按提示手动操作')) });
+        }
+      });
+      wrap.append(btn);
+      item.append(wrap);
+    } else if (it.action && it.action.kind === 'manual') {
+      const wrap = document.createElement('div');
+      wrap.className = 'pf-action pf-detail';
+      wrap.textContent = `⚠ ${it.action.label}`;
+      item.append(wrap);
+    }
+    list.append(item);
+  }
+  const rec = report.recommended || {};
+  if (sum) {
+    sum.textContent = t('{summary}。推荐配置：{v1} GB 内存 / ', { summary: report.summary, v1: Math.round((rec.memoryMB || 0) / 1024) })
+      + t('{v1} 核 / {v2} · 渲染 {v3}', { v1: rec.cores || 2, v2: rec.renderSize || 'auto', v3: rec.gpuMode || 'auto' })
+      + (edition === 'store' ? t('（商店版：系统功能只能在「Windows 功能」里手动开）') : '');
+  }
+  if (applyBtn) applyBtn.hidden = false;
+}
+
+async function runPreflight() {
+  const btn = $('btnPreflight');
+  const sum = $('preflightSummary');
+  if (!btn) return null;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = t('体检中…');
+  if (sum) sum.textContent = t('正在检查虚拟化、显卡、内存…（第一次约 2~3 秒）');
+  let r = null;
+  try {
+    r = await api.preflightRun();
+  } catch (e) {
+    r = { error: e.message || t('体检失败') };
+  }
+  btn.disabled = false;
+  btn.textContent = old;
+  renderPreflight(r);
+  return r;
+}
+
+/** 驱动（兼容补丁）：渲染清单 + 命中状态 */
+function renderDrivers(r) {
+  const list = $('drvList');
+  const sum = $('drvSummary');
+  if (!list) return;
+  const host = (r && r.host) || {};
+  const drivers = (r && r.drivers) || [];
+  const errors = (r && r.errors) || [];
+  const onCount = drivers.filter((d) => d.enabled && d.matched).length;
+  if (sum) {
+    const accel = host.accel === 'none' ? t('无硬件加速') : (host.accel || t('未知'));
+    sum.textContent = t('本机：{platform}/{arch} · {gpu} 显卡 · {accel}', { platform: host.platform || '', arch: host.arch || '', gpu: host.gpuVendor || t('未知'), accel })
+      + t(' · emulator {version}；驱动 {count} 个，本机已生效 {on} 个。', { version: host.emulatorVersion || t('未知'), count: drivers.length, on: onCount })
+      + (errors.length ? t(' {length} 个文件加载失败（见下）。', { length: errors.length }) : '');
+  }
+  list.textContent = '';
+  for (const d of drivers) {
+    const item = document.createElement('div');
+    item.className = d.enabled ? 'drv-item on' : 'drv-item';
+
+    const head = document.createElement('div');
+    head.className = 'drv-head';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!d.enabled;
+    cb.addEventListener('change', async () => {
+      const res = await api.driversSetEnabled(d.id, cb.checked).catch(() => null);
+      if (res && res.ok && res.overview) renderDrivers(res.overview);
+      else { cb.checked = !cb.checked; toast({ type: 'error', title: t('保存失败'), body: (res && res.error) || t('请稍后再试') }); }
+    });
+    const name = document.createElement('span');
+    name.className = 'drv-name';
+    name.textContent = d.name;
+    head.append(cb, name);
+
+    if (d.matched && d.enabled) {
+      const b = document.createElement('span');
+      b.className = 'drv-badge hit';
+      b.textContent = t('已生效');
+      head.append(b);
+    }
+    if (d.builtin) {
+      const b = document.createElement('span');
+      b.className = 'drv-badge';
+      b.textContent = t('内置示例');
+      head.append(b);
+    }
+    item.append(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'drv-meta';
+    meta.textContent = `v${d.version || '?'}`
+      + (d.author ? ` · ${d.author}` : '')
+      + ` · priority ${d.priority}`
+      + (d.hits && d.hits.length ? t(' · 命中：{v1}', { v1: d.hits.join(' / ') }) : t(' · 本机不匹配'));
+    item.append(meta);
+
+    if (d.description) {
+      const desc = document.createElement('div');
+      desc.className = 'drv-meta';
+      desc.textContent = d.description;
+      item.append(desc);
+    }
+    list.append(item);
+  }
+  for (const e of errors) {
+    const err = document.createElement('div');
+    err.className = 'drv-err';
+    err.textContent = t('{file}：{errors}', { file: String(e.file || '').split(/[\\/]/).pop(), errors: (e.errors || []).join(t('；')) });
+    list.append(err);
+  }
+  if (!drivers.length && !errors.length) {
+    const empty = document.createElement('div');
+    empty.className = 'drv-meta';
+    empty.textContent = t('还没有任何驱动。可以点「导出本机模板」做一个，或导入别人做好的 JSON。');
+    list.append(empty);
+  }
+}
+
+async function refreshDrivers() {
+  if (!$('drvList')) return;
+  const r = await api.driversList().catch(() => null);
+  if (!r) {
+    if ($('drvSummary')) $('drvSummary').textContent = t('读不到驱动列表（运行时可能还没部署）');
+    return;
+  }
+  renderDrivers(r);
 }
 
 function fillSettings(s) {
@@ -853,12 +1073,10 @@ function fillSettings(s) {
     }
     langSel.value = api.i18n.lang;
   }
-  $('setEngineMode').value = s.engine.mode;
-  if ($('setMumuPath')) $('setMumuPath').value = s.engine.mumuPath || '';
-  if ($('setFydeosHost')) $('setFydeosHost').value = s.engine.fydeosHost || '';
+  if ($('setEngineLabel')) $('setEngineLabel').value = t('ApkStart 自带运行时（QEMU + Android 14，独立运行）');
   syncBackendFields();
+  refreshDrivers().catch(() => {});
   $('setAdbPath').value = s.adbPath || '';
-  $('setDevice').value = s.device || '';
   $('setSystemImage').value = s.runtime.isoPath || '';
   $('setMemory').value = s.engine.memoryMB;
   $('setCores').value = s.engine.cores;
@@ -899,9 +1117,11 @@ function fillSettings(s) {
   if ($('setAutoFullscreen')) $('setAutoFullscreen').value = d.autoFullscreenOnLaunch === true ? 'on' : 'off';
   if ($('setLandscape')) $('setLandscape').value = d.landscape === true ? 'landscape' : 'portrait';
   if ($('setOrientationMode')) $('setOrientationMode').value = d.orientationMode || 'auto';
+  if ($('setAutoRotate')) $('setAutoRotate').value = d.autoRotate === false ? 'off' : 'on';
   if ($('setTabletMode')) $('setTabletMode').value = d.tabletMode === false ? 'off' : 'on';
   $('setPortrait').value = d.portrait || '900x1600';
-  if ($('setWindowEmbed')) $('setWindowEmbed').value = d.windowEmbed === false ? 'detached' : 'embed';
+  // 0.6.0 起默认原生窗口：只有显式 true 才是嵌入模式（旧配置里 undefined 视为原生）
+  if ($('setWindowEmbed')) $('setWindowEmbed').value = d.windowEmbed === true ? 'embed' : 'detached';
   $('portraitField').hidden = $('setDisplayMode').value === 'fullscreen';
 }
 
@@ -912,15 +1132,318 @@ async function refreshDataInfo() {
   const info = await api.dataInfo().catch(() => null);
   if (!info) { el.textContent = t('读取数据分区信息失败'); return; }
   const auto = Number(($('setDataGB') || {}).value || 0) === 0;
-  const img = info.imageGB ? `${info.imageGB} GB` : t('尚未创建');
+  // 有 quickboot 差量盘时底座镜像的大小不等于 guest 看到的容量（实测 8GB 镜像、guest 5.7GB），
+  // 与其显示一个会误导人的数字，不如明确说「以运行时为准」。
+  const img = info.overlay
+    ? t('快速启动差量盘（实际容量以运行时 /data 为准）')
+    : (info.fsGB ? t('实际文件系统 {fsGB} GB', { fsGB: info.fsGB }) : (info.imageGB ? `${info.imageGB} GB` : t('尚未创建')));
   const free = info.freeDiskMB ? `${(info.freeDiskMB / 1024).toFixed(1)} GB` : t('未知');
-  el.textContent = t('当前数据分区镜像：{img}{auto} · 所在磁盘剩余 {free}。', { img, auto: auto ? t('（自动）') : '', free })
-    + t('游戏提示「存储空间不足」就把这里调大后点「立即扩容」——扩容是就地做的，已装应用与存档都保留。');
+  const pending = Number(info.pendingGB) > 0
+    ? t(' 目标 {configuredGB} GB 还没生效：安卓正在用快速启动差量盘，需要「重置安卓数据」后按新容量重建（会清空已装应用）。', { configuredGB: info.configuredGB })
+    : '';
+  el.textContent = t('当前数据分区：{img}{auto} · 所在磁盘剩余 {free}。', { img, auto: auto ? t('（自动）') : '', free }) + pending
+    + t('游戏提示「存储空间不足」就把这里调大后点「立即扩容」；能就地扩容时不丢已装应用。');
+}
+
+/* ---------------- 设置页：分类导航 + 搜索 ---------------- */
+
+/**
+ * 设置项越来越多，一条长滚动找起来很费劲（用户 0.6.0 的原话：
+ * 「设置内做好分类功能」）。这里把设置按用途分成 8 类，左侧一列导航。
+ *
+ * 分类表必须与 index.html 里每个分组的 data-cat 一致 ——
+ * test/settings-categories-test.js 会校验这一致性。
+ */
+const SETTINGS_CATS = [
+  { id: 'basic', name: t('常用与安装') },
+  { id: 'display', name: t('显示与窗口') },
+  { id: 'input', name: t('操作与输入') },
+  { id: 'perf', name: t('性能与资源') },
+  { id: 'net', name: t('网络与下载') },
+  { id: 'diag', name: t('诊断与修复') },
+  { id: 'files', name: t('集成与文件') },
+  { id: 'about', name: t('更新与关于') },
+];
+
+const settingsCatState = { cat: 'basic', query: '' };
+
+/** 设置里所有带分类标记的分组（.group 和 details.advanced-group 都算） */
+function settingsGroups() {
+  return Array.from(document.querySelectorAll('#settingsBody [data-cat]'));
+}
+
+/** 分组内是否命中搜索词：标题、字段名、说明文字都算 */
+function groupMatches(group, q) {
+  if (!q) return true;
+  const text = (group.textContent || '').toLowerCase();
+  if (text.includes(q)) return true;
+  const title = group.querySelector('.group-title');
+  return !!title && title.textContent.toLowerCase().includes(q);
+}
+
+/** 切到某个分类 */
+function switchSettingsCat(cat, { keepQuery = false } = {}) {
+  const target = SETTINGS_CATS.some((c) => c.id === cat) ? cat : 'basic';
+  settingsCatState.cat = target;
+  if (!keepQuery) settingsCatState.query = '';
+  try { localStorage.setItem('apkstart.settings.cat', target); } catch (_) { /* ignore */ }
+  const search = $('setSearch');
+  if (search && !keepQuery) search.value = '';
+  const clear = $('btnClearSearch');
+  if (clear) clear.hidden = !settingsCatState.query;
+  document.querySelectorAll('#setNav .set-nav-item').forEach((b) => {
+    b.classList.toggle('on', b.dataset.cat === target);
+  });
+  applySettingsFilter();
+}
+
+/**
+ * 应用可见性：搜索时跨分类展示命中的分组（否则搜到的东西藏在别的分类里，
+ * 用户会以为「搜了没反应」）；没搜索时只显示当前分类。
+ */
+function applySettingsFilter() {
+  const q = settingsCatState.query.trim().toLowerCase();
+  const groups = settingsGroups();
+  const hitPerCat = {};
+  for (const g of groups) {
+    const hit = groupMatches(g, q);
+    const inCat = g.dataset.cat === settingsCatState.cat;
+    g.hidden = q ? !hit : !inCat;
+    if (hit) hitPerCat[g.dataset.cat] = (hitPerCat[g.dataset.cat] || 0) + 1;
+  }
+  // 分类按钮：搜索时标出哪些分类有命中项
+  document.querySelectorAll('#setNav .set-nav-item').forEach((b) => {
+    const n = hitPerCat[b.dataset.cat] || 0;
+    b.classList.toggle('dim', !!q && n === 0);
+    b.title = q ? t('{n} 项命中', { n }) : '';
+  });
+  // 最后一个可见分组不画分隔线（分组被隐藏后 :last-child 会选错对象）
+  const visible = groups.filter((g) => !g.hidden);
+  visible.forEach((g) => g.classList.remove('last-visible'));
+  if (visible.length) visible[visible.length - 1].classList.add('last-visible');
+  updateCatBadges();
+}
+
+/** 定位到某个分组：先切到它所属的分类，再滚动过去 */
+function focusGroup(el) {
+  if (!el) return;
+  const cat = el.dataset && el.dataset.cat;
+  if (cat) switchSettingsCat(cat);
+  const body = $('settingsBody');
+  if (body) body.scrollTop = 0;
+  if (typeof el.scrollIntoView === 'function') {
+    el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
+}
+
+function bindSettingsCategory() {
+  const nav = $('setNav');
+  if (nav) {
+    nav.addEventListener('click', (e) => {
+      const btn = e.target.closest('.set-nav-item');
+      if (!btn) return;
+      switchSettingsCat(btn.dataset.cat);
+      const body = $('settingsBody');
+      if (body) body.scrollTop = 0;
+    });
+  }
+
+  const search = $('setSearch');
+  const clear = $('btnClearSearch');
+  if (search) {
+    search.addEventListener('input', () => {
+      settingsCatState.query = search.value || '';
+      if (clear) clear.hidden = !settingsCatState.query;
+      applySettingsFilter();
+    });
+    // 回车：跳到第一个命中的分组
+    search.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const hit = settingsGroups().find((g) => !g.hidden);
+      if (hit) focusGroup(hit);
+    });
+  }
+  if (clear) {
+    clear.addEventListener('click', () => {
+      settingsCatState.query = '';
+      if (search) search.value = '';
+      clear.hidden = true;
+      applySettingsFilter();
+    });
+  }
+
+  // 记住上次停留的分类
+  try {
+    const last = localStorage.getItem('apkstart.settings.cat');
+    if (last && SETTINGS_CATS.some((c) => c.id === last)) settingsCatState.cat = last;
+  } catch (_) { /* ignore */ }
+  switchSettingsCat(settingsCatState.cat);
+}
+
+/* ---------------- 自动检测（自动 debug）---------------- */
+
+/** 自动检测的问题分类名（与 src/core/autodebug.js 的 CATEGORIES 对应） */
+const DEBUG_CATS = [
+  { id: 'runtime', name: t('运行时') },
+  { id: 'device', name: t('设备连接') },
+  { id: 'storage', name: t('存储') },
+  { id: 'settings', name: t('设置') },
+  { id: 'network', name: t('网络') },
+  { id: 'logs', name: t('日志') },
+];
+
+let autodebugLast = null;
+
+function renderAutodebug(res) {
+  const list = $('autodebugList');
+  const txt = $('autodebugStateText');
+  if (!list) return;
+  autodebugLast = res || null;
+  const issues = (res && res.issues) || [];
+  const at = res && res.at;
+
+  if (txt) {
+    if (res && res.running) txt.textContent = t('正在检测…');
+    else if (!at) txt.textContent = t('尚未检测');
+    else if (!issues.length) txt.textContent = t('上次检测 {v1} · 一切正常', { v1: relTime(at) });
+    else txt.textContent = t('上次检测 {v1} · {length} 项待处理', { v1: relTime(at), length: issues.length });
+  }
+
+  if (!issues.length) {
+    list.innerHTML = `<div class="dbg-ok">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>
+      <span>${esc(t('没有发现影响使用的问题。运行时、adb 授权、磁盘、数据分区、快照与设置冲突都检查过了。'))}</span>
+    </div>`;
+    updateCatBadges();
+    return;
+  }
+
+  const byCat = new Map();
+  for (const it of issues) {
+    const key = it.category || 'runtime';
+    if (!byCat.has(key)) byCat.set(key, []);
+    byCat.get(key).push(it);
+  }
+  const order = DEBUG_CATS.map((c) => c.id);
+  const keys = Array.from(byCat.keys()).sort((a, b) => {
+    const ia = order.indexOf(a); const ib = order.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+
+  list.innerHTML = keys.map((key) => {
+    const name = (DEBUG_CATS.find((c) => c.id === key) || {}).name || key;
+    const items = byCat.get(key);
+    return `<div class="dbg-group">
+      <div class="dbg-group-title">${esc(name)}<span class="dbg-count">${items.length}</span></div>
+      ${items.map((it) => `
+        <div class="dbg-item ${esc(it.severity || 'info')}">
+          <span class="dbg-sev"></span>
+          <div class="dbg-body">
+            <div class="dbg-name">${esc(it.title || '')}</div>
+            <div class="dbg-hint">${esc(it.hint || '')}</div>
+            ${it.detail ? `<div class="dbg-detail">${esc(it.detail)}</div>` : ''}
+          </div>
+          ${it.fix ? `<button class="dbg-fix" data-code="${esc(it.code)}">${esc(t('处理'))}</button>` : ''}
+        </div>`).join('')}
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.dbg-fix').forEach((b) => {
+    b.addEventListener('click', () => {
+      const issue = issues.find((x) => x.code === b.dataset.code);
+      if (issue) fixIssue(issue);
+    });
+  });
+
+  updateCatBadges();
+}
+
+/** 分类按钮上的问题角标：只在有问题的分类上显示数字 */
+function updateCatBadges() {
+  const issues = (autodebugLast && autodebugLast.issues) || [];
+  document.querySelectorAll('#setNav .set-nav-badge').forEach((el) => {
+    const cat = el.dataset.badge;
+    // 自动检测的问题不一定都归属某个设置分类，只有设置类问题才在「诊断与修复」上打标
+    const n = cat === 'diag' ? issues.filter((i) => i.severity === 'error').length : 0;
+    el.hidden = n === 0;
+    el.textContent = n ? String(n) : '';
+    el.classList.toggle('warn', false);
+  });
+}
+
+function bindAutodebug() {
+  const btn = $('btnAutodebugRun');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = t('检测中…');
+      try {
+        const r = await api.autodebugRun().catch(() => null);
+        if (r) renderAutodebug(r);
+        else toast({ title: t('检测失败'), body: t('采集状态时出错，稍后再试一次'), type: 'error' });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = old;
+      }
+    });
+  }
+
+  const report = $('btnAutodebugReport');
+  if (report) {
+    report.addEventListener('click', async () => {
+      const r = await api.doctorReport().catch(() => null);
+      if (r && r.ok !== false) toast({ title: t('诊断报告已导出'), body: t('把报告发给作者可以最快定位问题'), type: 'ok' });
+      else toast({ title: t('导出失败'), body: (r && r.error) || t('请重试'), type: 'error' });
+    });
+  }
+
+  const auto = $('setAutodebugAuto');
+  if (auto) {
+    auto.addEventListener('change', async () => {
+      const r = await api.autodebugConfig({ auto: auto.checked }).catch(() => null);
+      if (r) fillAutodebugSettings(r);
+      toast({
+        title: auto.checked ? t('已开启自动检测') : t('已关闭自动检测'),
+        body: auto.checked ? t('后台会定时检查，发现新问题才提醒') : t('随时可以点「立即检测」手动跑一次'),
+        type: 'info',
+      });
+    });
+  }
+
+  const interval = $('setAutodebugInterval');
+  if (interval) {
+    interval.addEventListener('change', async () => {
+      const r = await api.autodebugConfig({ intervalMin: Number(interval.value) }).catch(() => null);
+      if (r) fillAutodebugSettings(r);
+      toast({ title: t('检测间隔已更新'), body: t('每 {v1} 分钟检测一次', { v1: r ? r.intervalMin : interval.value }), type: 'ok' });
+    });
+  }
+
+  const notify = $('setAutodebugNotify');
+  if (notify) {
+    notify.addEventListener('change', async () => {
+      const r = await api.autodebugConfig({ notify: notify.checked }).catch(() => null);
+      if (r) fillAutodebugSettings(r);
+    });
+  }
+}
+
+function fillAutodebugSettings(cfg) {
+  if (!cfg) return;
+  const auto = $('setAutodebugAuto');
+  if (auto) auto.checked = cfg.auto !== false;
+  const interval = $('setAutodebugInterval');
+  if (interval) interval.value = String(cfg.intervalMin || 10);
+  const notify = $('setAutodebugNotify');
+  if (notify) notify.checked = cfg.notify !== false;
 }
 
 async function openSettings() {
   state.settings = await api.getSettings();
   fillSettings(state.settings);
+  fillAutodebugSettings((state.settings && state.settings.debug) || {});
   const info = await api.info();
   $('setRuntimeDir').value = info.runtimeDir || info.dataDir;
   if ($('setAvdDir')) {
@@ -948,6 +1471,9 @@ async function openSettings() {
   $('settingsMask').classList.add('on');
   refreshAndroid();
   refreshDataInfo();
+  applySettingsFilter();
+  // 先把上一次的检测结果铺上（别让面板空着等），再后台刷新一份
+  api.autodebugState().then((r) => { if (r) renderAutodebug(r); }).catch(() => {});
 }
 
 function closeSettings() {
@@ -1097,22 +1623,59 @@ function bindSettings() {
     });
   }
 
-  $('setEngineMode').addEventListener('change', async (e) => {
-    await save({ engine: { mode: e.target.value } });
-    syncBackendFields();
-    refreshStatus();
-  });
-  if ($('setMumuPath')) {
-    $('setMumuPath').addEventListener('change', (e) => save({ engine: { mumuPath: e.target.value.trim() } }));
+  if ($('btnPreflight')) $('btnPreflight').addEventListener('click', () => runPreflight());
+  if ($('btnPreflightApply')) {
+    $('btnPreflightApply').addEventListener('click', async () => {
+      const btn = $('btnPreflightApply');
+      btn.disabled = true;
+      const r = await api.preflightApply().catch(() => null);
+      btn.disabled = false;
+      if (!r || !r.ok) {
+        toast({ type: 'error', title: t('应用失败'), body: (r && r.error) || t('请稍后再试') });
+        return;
+      }
+      state.settings = r.settings;
+      toast({
+        type: 'ok',
+        title: t('已按这台机器配置好'),
+        body: t('内存 {v1} GB / {cores} 核 / {renderSize}', { v1: Math.round((r.recommended.memoryMB || 0) / 1024), cores: r.recommended.cores, renderSize: r.recommended.renderSize })
+          + (r.driverFile ? t('；已生成驱动，下次开机会自动套用') : ''),
+      });
+      if (r.driverError) toast({ type: 'warn', title: t('驱动没写成功'), body: r.driverError });
+      fillSettings(r.settings);
+      refreshStatus();
+    });
   }
-  if ($('setFydeosHost')) {
-    $('setFydeosHost').addEventListener('change', (e) => save({ engine: { fydeosHost: e.target.value.trim() } }));
+  if ($('btnDrvReload')) $('btnDrvReload').addEventListener('click', () => refreshDrivers());
+  if ($('btnDrvFolder')) {
+    $('btnDrvFolder').addEventListener('click', async () => {
+      const r = await api.driversOpenFolder().catch(() => null);
+      if (!r || !r.ok) toast({ type: 'error', title: t('打不开驱动目录') });
+    });
   }
+  if ($('btnDrvImport')) {
+    $('btnDrvImport').addEventListener('click', async () => {
+      const r = await api.driversImport().catch(() => null);
+      if (!r || r.canceled) return;
+      if (!r.ok) {
+        toast({ type: 'error', title: t('导入失败'), body: (r.errors || []).slice(0, 3).join(t('；')) });
+        return;
+      }
+      toast({ type: 'ok', title: t('驱动已导入并启用'), body: `${r.driver.name} v${r.driver.version}` });
+      if (r.overview) renderDrivers(r.overview);
+    });
+  }
+  if ($('btnDrvExport')) {
+    $('btnDrvExport').addEventListener('click', async () => {
+      const r = await api.driversExportTemplate().catch(() => null);
+      if (!r || r.canceled) return;
+      if (!r.ok) { toast({ type: 'error', title: t('导出失败') }); return; }
+      toast({ type: 'ok', title: t('模板已导出'), body: t('改完 effect 后放到驱动目录，点「刷新」即可生效') });
+      refreshDrivers();
+    });
+  }
+
   $('setAdbPath').addEventListener('change', (e) => save({ adbPath: e.target.value.trim() }));
-  $('setDevice').addEventListener('change', async (e) => {
-    await save({ device: e.target.value.trim() });
-    refreshStatus();
-  });
   $('setSystemImage').addEventListener('change', (e) => save({ runtime: { isoPath: e.target.value.trim() } }));
   // 内存 / 核心：填了具体值就关掉「自动」，填 0 又回到自动。
   // 旧代码只写 memoryMB，而 overridesFromSettings 只在 autoMemory=false 时才认它，
@@ -1181,10 +1744,35 @@ function bindSettings() {
       const r = await api.setDataSize(gb).catch((e) => ({ ok: false, error: e.message }));
       $('btnGrowData').disabled = false;
       $('btnGrowData').textContent = old;
+      if (r && !r.ok && r.needsReset) {
+        // 快速启动的差量盘挡着：就地扩容做不到，只能按新容量重建 /data。
+        // 这是明确的数据丢失操作，必须单独再确认一次。
+        const again = await api.confirm({
+          title: t('需要重置安卓数据才能扩容'),
+          message: t('安卓正在使用快速启动差量盘，就地扩容改不到它。要拿到 {gb} GB 空间，必须按新容量重建 /data。', { gb }),
+          detail: t('重建会清空已安装的应用与存档（模拟器本身和镜像不受影响）。确定继续吗？'),
+          okLabel: t('清空并重建'),
+        });
+        if (again.response !== 1) { refreshDataInfo(); return; }
+        $('btnGrowData').disabled = true;
+        $('btnGrowData').textContent = t('重建中…');
+        const rr = await api.resetAndResize(gb).catch((e) => ({ ok: false, error: e.message }));
+        $('btnGrowData').disabled = false;
+        $('btnGrowData').textContent = old;
+        toast({
+          type: rr && rr.ok ? 'ok' : 'error',
+          title: rr && rr.ok ? t('已按新容量重建') : t('重建失败'),
+          body: rr && rr.ok
+            ? t('下次打开应用会按 {gb} GB 重建 /data（首次进入会多等几十秒）', { gb })
+            : (rr && rr.error) || t('未知错误'),
+        });
+        refreshDataInfo();
+        return;
+      }
       toast({
         type: r && r.ok ? 'ok' : 'error',
         title: r && r.ok ? t('数据分区已扩容') : t('扩容失败'),
-        body: r && r.ok ? t('现在约 {gb} GB 可用', { gb: r.imageGB || gb }) : (r && r.error) || t('未知错误'),
+        body: r && r.ok ? t('现在约 {gb} GB 可用', { gb: r.fsGB || r.imageGB || gb }) : (r && r.error) || t('未知错误'),
       });
       refreshDataInfo();
     });
@@ -1275,6 +1863,17 @@ function bindSettings() {
       });
     });
   }
+  if ($('setAutoRotate')) {
+    $('setAutoRotate').addEventListener('change', async (e) => {
+      const on = e.target.value === 'on';
+      state.settings = await api.setSettings({ display: { autoRotate: on } });
+      toast({
+        title: on ? t('已打开镜像自动旋转') : t('已关闭镜像自动旋转'),
+        body: t('下次打开应用时写进安卓镜像。画面方向仍由屏幕方向策略决定，不受此开关影响。'),
+        type: 'ok',
+      });
+    });
+  }
   if ($('setTabletMode')) {
     $('setTabletMode').addEventListener('change', async (e) => {
       const on = e.target.value === 'on';
@@ -1303,10 +1902,15 @@ function bindSettings() {
   });
   $('setWindowEmbed').addEventListener('change', async (e) => {
     const embed = e.target.value === 'embed';
-    state.settings = await api.setSettings({ display: { windowEmbed: embed } });
+    // windowEmbedChosen 标记「用户自己选过」：之后升级不会再被默认值迁移覆盖。
+    state.settings = await api.setSettings({
+      display: { windowEmbed: embed, windowEmbedChosen: true },
+    });
     toast({
-      title: embed ? t('已切回嵌入模式') : t('已切到独立窗口模式'),
-      body: t('下次打开应用时生效。独立模式下安卓画面由模拟器自己开窗口，方向与缩放都由它处理。'),
+      title: embed ? t('已切回嵌入模式') : t('已切到原生窗口'),
+      body: embed
+        ? t('下次打开应用时生效。嵌入模式观感统一、标题栏带旋转按钮，但缩放/旋转时更容易掉帧或出现黑边。')
+        : t('下次打开应用时生效。原生窗口由模拟器自己渲染与排布，帧率和缩放更稳，横屏可用托盘菜单或 Ctrl+Alt+R。'),
       type: 'ok',
     });
   });
@@ -1626,20 +2230,6 @@ function bindSettings() {
     });
   }
 
-  $('btnProbe').addEventListener('click', async () => {
-    const el = $('probeResult');
-    el.textContent = t('探测中…');
-    const found = await api.runtimeProbe();
-    if (!found.length) {
-      el.textContent = t('未发现已运行的运行时');
-      return;
-    }
-    el.textContent = t('发现：{list}', { list: found.map((f) => f.name).join(t('、')) });
-    await api.setSettings({ device: found[0].serial });
-    $('setDevice').value = found[0].serial;
-    refreshStatus();
-  });
-
   $('btnRuntimeStart').addEventListener('click', async () => {
     const el = $('probeResult');
     el.textContent = t('正在启动…');
@@ -1707,8 +2297,8 @@ function bindEvents() {
   $('envChip').addEventListener('click', () => {
     openSettings().then(() => {
       const box = $('envCheck');
-      if (box && !box.hidden) box.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      else $('runtimeGroup').scrollIntoView({ block: 'start', behavior: 'smooth' });
+      if (box && !box.hidden) focusGroup(box);
+      else focusGroup($('runtimeGroup'));
     }).catch(() => {});
   });
 
@@ -1870,6 +2460,15 @@ function bindEvents() {
     if (wm && !wm.hidden) renderWelcomeTips();
   });
   api.on('update:progress', (p) => renderUpdateProgress(p));
+  // 自动检测：主进程定时跑完后把结果推过来，设置页开着就直接刷新面板
+  api.on('autodebug:state', (r) => {
+    if (r && r.running) {
+      const txt = $('autodebugStateText');
+      if (txt) txt.textContent = t('正在检测…');
+      return;
+    }
+    renderAutodebug(r);
+  });
 }
 
 /* ---------------- 启动 ---------------- */
@@ -1878,6 +2477,8 @@ async function init() {
   if (window.translateDom) translateDom(document.body);
   bindEvents();
   bindSettings();
+  bindSettingsCategory();
+  bindAutodebug();
   bindUpdate();
   bindAndroid();
   bindWelcome();
@@ -2116,6 +2717,89 @@ async function fixIssue(issue) {
     case 'lock': {
       const r = await api.clearLocks().catch(() => ({ ok: false }));
       toast(r.ok ? { title: t('已清理残留锁文件'), type: 'ok' } : { title: t('清理失败'), body: r.error, type: 'error' });
+      break;
+    }
+    // ---- 自动检测（自动 debug）新增的修复动作 ----
+    case 'restartRuntime': {
+      // unauthorized / 引导卡死 / 孤儿锁的首选自愈动作：停一次再拉起来（走冷启动）
+      const tt = toast({ title: t('正在重启安卓运行时…'), body: t('会重新引导一次，大约十几秒'), type: 'info', sticky: true, spinner: true });
+      const r = await api.restartRuntime().catch(() => ({ ok: false }));
+      if (r && r.ok) {
+        tt.update({ title: t('安卓运行时已重启'), body: t('授权弹窗请点「允许」'), type: 'ok' });
+        setTimeout(tt.dismiss, 3000);
+      } else {
+        tt.update({ title: t('重启失败'), body: (r && r.error) || t('请看诊断报告'), type: 'error' });
+      }
+      break;
+    }
+    case 'orphans': {
+      const r = await api.clearOrphans().catch(() => ({ ok: false }));
+      toast(r && r.ok
+        ? { title: t('已清理残留的模拟器进程'), type: 'ok' }
+        : { title: t('清理失败'), body: (r && r.error) || t('请重试'), type: 'error' });
+      break;
+    }
+    case 'snapshots': {
+      const r = await api.clearSnapshot().catch(() => ({ ok: false }));
+      toast(r && r.ok
+        ? { title: t('已作废快速启动快照'), body: t('下次打开应用会走一次完整冷启动'), type: 'ok' }
+        : { title: t('作废失败'), body: (r && r.error) || t('请重试'), type: 'error' });
+      break;
+    }
+    case 'dataReset': {
+      // 扩容被差量盘挡住时必须重建：会清掉已装应用，所以只引导、不自动做。
+      toast({
+        title: t('需要重建安卓数据分区'),
+        body: t('到「设置 → 性能与资源」点「立即扩容」；提示需要重置时确认一次（会清空已装应用）。'),
+        type: 'info',
+        sticky: true,
+      });
+      openSettings().then(() => focusGroup($('perfGroup'))).catch(() => {});
+      break;
+    }
+    case 'orientation': {
+      // 让物理面板方向跟上策略：策略要横屏就切横屏，要竖屏就切竖屏
+      const s = (state.settings && state.settings.display) || {};
+      const mode = s.orientationMode || 'auto';
+      if (mode === 'auto') {
+        toast({ title: t('当前是「跟随应用」'), body: t('面板方向会按应用自动切换；若某个应用方向不对，可对它单独指定。'), type: 'info' });
+        break;
+      }
+      const wantLandscape = mode === 'landscape';
+      state.settings = await api.setSettings({ display: { landscape: wantLandscape } });
+      fillSettings(state.settings);
+      toast({
+        title: wantLandscape ? t('面板已切成横屏') : t('面板已切成竖屏'),
+        body: t('下次打开应用生效'),
+        type: 'ok',
+      });
+      break;
+    }
+    case 'shared': {
+      toast({ title: t('请检查共享目录'), body: t('到「设置 → 集成与文件」确认本机共享目录存在且可写。'), type: 'info', sticky: true });
+      openSettings().then(() => focusGroup(document.querySelector('#settingsBody [data-cat="files"]'))).catch(() => {});
+      break;
+    }
+    case 'repairNetwork': {
+      const tt = toast({ title: t('正在重置安卓网络…'), body: t('应用清单会保留'), type: 'info', sticky: true, spinner: true });
+      const r = await api.runtimeRepairNetwork().catch(() => ({ ok: false }));
+      if (r && r.ok !== false) {
+        tt.update({ title: t('安卓网络已重置'), body: t('下次打开应用重新联网'), type: 'ok' });
+        setTimeout(tt.dismiss, 3000);
+      } else {
+        tt.update({ title: t('重置失败'), body: (r && r.error) || t('请重试'), type: 'error' });
+      }
+      break;
+    }
+    case 'report': {
+      const r = await api.doctorReport().catch(() => null);
+      toast(r && r.ok !== false
+        ? { title: t('诊断报告已导出'), body: t('把报告发给作者可以最快定位问题'), type: 'ok' }
+        : { title: t('导出失败'), body: (r && r.error) || t('请重试'), type: 'error' });
+      break;
+    }
+    case 'settings': {
+      openSettings();
       break;
     }
     default:

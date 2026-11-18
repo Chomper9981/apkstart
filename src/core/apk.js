@@ -8,6 +8,7 @@ const fs = require('fs');
 const { ZipFile } = require('./zip');
 const { parseAxml, attr, attrValue, children } = require('./axml');
 const { ResTable } = require('./arsc');
+const { validPackageName } = require('./pkgname');
 
 const LAUNCHER_ACTIONS = ['android.intent.action.MAIN'];
 const LAUNCHER_CATS = ['android.intent.category.LAUNCHER'];
@@ -181,6 +182,11 @@ function parseApkZip(zip, filePath, stat) {
   // attrValue 默认只认 android 命名空间，传 null 表示不限定命名空间。
   const packageName = attrValue(manifest, 'package', null);
   if (!packageName) throw new Error(t('清单中未找到 package 名'));
+  // package 会一路流到路径拼接和 adb shell，必须是纯合法的 Android 包名。
+  // 恶意/损坏的清单里塞进 "../"、盘符或 shell 元字符时在这里就拦下（issue #2 P0-1）。
+  if (!validPackageName(packageName)) {
+    throw new Error(t('清单中的 package 名不合法：{name}', { name: JSON.stringify(String(packageName).slice(0, 80)) }));
+  }
 
   const versionName = attrValue(manifest, 'versionName') || '1.0';
   const versionCodeRaw = attrValue(manifest, 'versionCode');

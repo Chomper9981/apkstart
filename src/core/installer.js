@@ -167,6 +167,32 @@ class Installer {
       meta: { label: meta.label, package: meta.package, versionName: meta.versionName },
     });
 
+    // 50GB 级游戏：先核对模拟器数据盘剩余空间，而不是装到一半才报
+    // INSTALL_INSUFFICIENT_STORAGE（用户看到的是「装了很久然后失败」）。
+    try {
+      const backend = this.runtime && this.runtime.backend;
+      if (backend && typeof backend.checkDiskFor === 'function') {
+        let bytes = 0;
+        if (bundle && bundle.files) {
+          for (const f of bundle.files) {
+            try { bytes += fs.statSync(f).size; } catch (_) { /* 忽略临时文件 */ }
+          }
+        } else {
+          try { bytes = fs.statSync(filePath).size; } catch (_) { /* 用 0 兜底 */ }
+        }
+        const verdict = backend.checkDiskFor(bytes);
+        if (!verdict.ok) {
+          onProgress({ stage: 'error', message: verdict.message });
+          const err = new Error(verdict.message);
+          err.needsSetup = 'disk';
+          throw err;
+        }
+      }
+    } catch (e) {
+      if (e && e.needsSetup === 'disk') throw e;
+      // 容量探测失败不能挡住安装
+    }
+
     try {
       // 零配置：仅含 ARM 库的应用自动补齐带 ARM 翻译层的镜像，用户不用开任何开关
       if (isArmOnly(meta) && !this.runtime.provisioner.playImageInfo().ok) {
@@ -277,6 +303,8 @@ class Installer {
       // 用户手动设过 orientationOverride 时以用户的为准，这里只是「默认值」。
       orientation: meta.orientation || (existing ? existing.orientation || null : null),
       pinned: existing ? !!existing.pinned : false,
+      // 重新装过 = 权限表可能被重置，清掉「已授过」缓存，下次启动重新核一遍
+      permGranted: false,
     };
 
     store.upsertApp(app);
@@ -490,10 +518,16 @@ class Installer {
     // 应用可能还没装进当前运行时（镜像重建 / 清过数据 / 首次），直接拉起会报
     // "Invalid packageName"。先在本地缓存里把它装上再启动，这样「点开应用」永远能进，
     // 不用先手动装一遍——这正是「点击已安装应用直接进入系统」想要的体验。
+    // 关键：用 isInstalled()（pm path + 逐个核对 APK 文件真实存在）而不是
+    // `pm list packages`。快照与数据分区不一致时 PackageManager 仍报 installed=true，
+    // 但 /data/app 下文件已被回滚掉 —— 这时 am start 必然失败。文件校验不通过就重装。
     if (app && app.apkPath && fs.existsSync(app.apkPath)) {
-      const pkgs = await rt.client.shell(`pm list packages ${pkg}`, { timeout: 8000 }).catch(() => '');
-      if (!new RegExp(`package:${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(pkgs)) {
-        onLog(t('应用尚未安装，正在自动安装…'));
+      let installed = false;
+      try { installed = await rt.client.isInstalled(pkg); } catch (_) { /* 当作未安装，走重装 */ }
+      if (!installed) {
+        onLog(t('应用文件缺失（快照与数据不一致），正在用本地备份自动重装…'));
+        // 重装前作废快照：否则旧快照的 packages.xml 仍说「已装」，下次又不对
+        try { this.runtime.emulator?.invalidateSnapshot(); } catch (_) { /* ignore */ }
         await rt.client.install(app.apkPath).catch((e) => onLog(t('自动安装失败：{msg}', { msg: e.message })));
       }
     }

@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { hookOptions } = require('./pointer');
 const store = require('./store');
+const { physicalRect } = require('./geometry');
 
 const TITLEBAR_H = 38;
 /**
@@ -31,8 +32,8 @@ class AppWindow {
   constructor({ agent, setOrientation, mouseHook = false, pointerConfig = null, windowTargets = null }) {
     this.agent = agent;
     this.setOrientation = setOrientation || null;
-    // 画面窗口的候选句柄来源：自带底座为 null（由窗口代理自己找），
-    // 第三方底座（MuMu 等）传入一个返回 ["0x…"] 的函数，每次 embed 现取。
+    // 画面窗口的候选句柄来源：现在只有一个底座，恒为 null，
+    // 由窗口代理按进程作用域自己找（这些窗口都是我们拉起的 emulator 创建的）。
     this.windowTargets = typeof windowTargets === 'function' ? windowTargets : null;
     // 全局鼠标钩子只在「应用窗口前台 + 至少一项映射开启」时安装。
     // pointerConfig 传函数：设置页改了开关，下一次 focus 就生效，不用重启。
@@ -68,7 +69,10 @@ class AppWindow {
   _area() {
     const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
     const a = d.workArea || d.bounds;
-    return { x: a.x, y: a.y, w: a.width, h: a.height };
+    // workArea 是 DIP（逻辑像素）。窗口代理进程是 per-monitor DPI-aware 的，
+    // SetWindowPos 收的是物理像素，所以独立窗口模式把这里的值交给 agent.layout
+    // 之前必须乘 sf 换算。sf 与 area 取自同一块屏幕，多显示器也不会用错缩放比。
+    return { x: a.x, y: a.y, w: a.width, h: a.height, sf: d.scaleFactor || 1 };
   }
 
   /**
@@ -101,6 +105,17 @@ class AppWindow {
   }
 
   /**
+   * 把一块 DIP（逻辑像素）矩形换算成物理像素，供窗口代理的 SetWindowPos 使用。
+   * Electron 的 screen/BrowserWindow 坐标一律是 DIP；而 agent.ps1 顶层声明了
+   * per-monitor v2 DPI 感知，Win32 的 SetWindowPos 收到的是物理像素。二者混用
+   * 在 125%/150% 缩放下就是「窗口只显示一半 / 偏到角落 / 点击错位」的根因
+   * （issue #99）。_rect() 早已乘过 sf，这里补上独立窗口模式缺的这一环。
+   */
+  _physical(rect, sf) {
+    return physicalRect(rect, sf || this._scale());
+  }
+
+  /**
    * 打开（或复用）应用窗口。
    * @param {object} o { pkg, label, iconPath, portrait, fullscreen, detached,
    *                     showWhileWaiting, onClosed }
@@ -112,6 +127,7 @@ class AppWindow {
   open(o) {
     const { pkg, label, iconPath, portrait, fullscreen, detached } = o;
     this.detachedMode = !!detached;
+    this.waitingForRestart = false;
     this._showWhileWaiting = !!o.showWhileWaiting;
     this._closedCb = o.onClosed || null;
     if (this.isOpen && this.pkg === pkg) {
@@ -264,6 +280,33 @@ class AppWindow {
     this._push();
   }
 
+  /**
+   * 独立窗口模式下「临时把壳窗口亮出来」。
+   *
+   * 场景：切换到一个横竖屏不同的应用时要重启安卓运行时（约 40 秒），这期间
+   * 模拟器原生窗口会被销毁、新窗口还没建出来。如果壳窗口此刻是隐藏的，屏幕上
+   * 什么都没有 —— 用户会以为程序退出了。启动阶段靠 showWhileWaiting 露一次，
+   * 但那时候 pre-attach 一成功就会把它收起来；等到真正重启时反而没人再显示。
+   *
+   * 所以重启前后显式调用一次：先亮出带提示的壳，等新窗口接上后由
+   * openDetached() 第一行的 hide() 收掉。
+   */
+  showWaiting(tip) {
+    if (!this.isOpen) return false;
+    // 标记「正在等待重启」：启动阶段那条 pre-attach 轮询看到它会主动让路，
+    // 否则它下一轮 openDetached() 会先把壳窗口 hide 掉，用户就又对着空桌面干等。
+    this.waitingForRestart = true;
+    if (tip) this.state = { ...this.state, tip, ready: false };
+    this._push();
+    try {
+      this.win.show();
+      this.win.moveTop();
+    } catch (_) {
+      return false;
+    }
+    return true;
+  }
+
   _push() {
     if (!this.isOpen) return;
     try {
@@ -295,7 +338,12 @@ class AppWindow {
    * @returns {Promise<boolean>} 是否成功切到独立窗口
    */
   async openDetached() {
-    if (!this.isOpen) return false;
+    // 壳窗口已经关掉（用户点了关闭 / 启动过程中被收掉）时没有可承载的对象。
+    // 把原因记下来：否则上层日志只能打一个 "unknown"，完全看不出是「窗口没了」
+    // 还是「模拟器窗口找不到」。
+    if (!this.isOpen) { this.lastEmbedError = 'shell-closed'; return false; }
+    // 真正开始接管，等待标记到此为止（下一轮 pre-attach 可以正常重试）
+    this.waitingForRestart = false;
     // 壳窗口在独立模式下绝不能露脸（它没有内容，只会是一块黑）。
     // 但 showWhileWaiting 时它现在是可见的「等待提示」，这里负责收起它。
     try { this.win.hide(); } catch (_) { /* ignore */ }
@@ -342,10 +390,15 @@ class AppWindow {
     let x;
     let y;
     if (this._wantFullscreen) {
-      w = area.w;
-      h = area.h;
-      x = area.x;
-      y = area.y;
+      // 「铺满」也要守住面板比例。竖屏面板（720x1280）塞进 1920x1080 的屏幕时，
+      // 直接把窗口设成 area.w × area.h，Qt 会按比例把它缩回去，但位置仍留在
+      // area 左上角 —— 用户看到的是贴在屏幕左上角的一条竖窗，而不是"全屏"。
+      // 这里按比例取最大可用矩形并居中，横屏面板本来比例贴合，效果就是真正的铺满。
+      const fitW = Math.min(area.w, Math.round(area.h * ratio));
+      w = fitW;
+      h = Math.round(fitW / ratio);
+      x = Math.round(area.x + (area.w - w) / 2);
+      y = Math.round(area.y + (area.h - h) / 2);
       // 同步全屏标记，否则第一次点「最大化」按钮会误判为「进入全屏」而不是还原。
       this._detachedFullscreen = true;
     } else {
@@ -358,7 +411,10 @@ class AppWindow {
       x = Math.round(area.x + (area.w - w) / 2);
       y = Math.round(area.y + 60);
     }
-    const lay = await this.agent.layout({ x, y, w, h })
+    // area/x/y/w/h 都是 Electron 的 DIP 逻辑像素，而窗口代理的 SetWindowPos 收
+    // 物理像素。150% 缩放下不换算，窗口就只有 2/3 大并偏左上角——即 issue #99
+    // 的「显示一半」。_rect()（嵌入模式）早已乘过 sf，这里补齐独立模式的缺口。
+    const lay = await this.agent.layout(this._physical({ x, y, w, h }, area.sf))
       .catch((e) => ({ ok: false, error: e.message }));
     this._detachedDebug += ` layout=${JSON.stringify(lay)}`;
     this.lastEmbedError = this._detachedDebug;
@@ -373,7 +429,7 @@ class AppWindow {
       if (!this.isOpen) return false;
       const hwnd = this._hwnd();
       if (!hwnd) return false;
-      // 第三方底座（MuMu 等）由外部提供候选句柄；拿不到就等一下再试
+      // 外部若提供了候选句柄（历史接口，当前恒为 null）；拿不到就等一下再试
       // —— 句柄是每次开机重新分配的，缓存一份旧的会把窗口嵌错地方。
       let targets = null;
       if (typeof this.windowTargets === 'function') {
@@ -456,10 +512,14 @@ class AppWindow {
    * 1280x720 并重启模拟器。重启约 30~60 秒，所以这里只做一次、并给出明确提示。
    *
    * @param {(next:boolean)=>Promise<boolean>} [onRestart] 由上层注入的重启实现
+   * @param {boolean} [explicitNext] 目标方向。传入时直接用它，不再取反 ——
+   *        旋转入口统一算好方向后传进来，避免这里和上层各算各的导致
+   *        「写进 apps.json 的覆盖值」与「实际切过去的面板方向」相反。
    */
-  async rotate(onRestart) {
+  async rotate(onRestart, explicitNext) {
     if (!this.isOpen) return this.state.landscape;
-    const next = !this.state.landscape;
+    const next = explicitNext === undefined || explicitNext === null
+      ? !this.state.landscape : !!explicitNext;
     this.setState({ tip: next ? t('正在切换到横屏（重启安卓运行时，约 30-60 秒）…') : t('正在切回竖屏（重启安卓运行时，约 30-60 秒）…'), ready: false });
     if (typeof onRestart === 'function') {
       const ok = await onRestart(next).catch(() => false);
@@ -516,8 +576,17 @@ class AppWindow {
           }
         } catch (_) { /* 拿不到就还原时用默认 */ }
         this._detachedFullscreen = true;
-        await this.agent.layout({ x: area.x, y: area.y, w: area.w, h: area.h })
-          .catch(() => {});
+        // 同 openDetached：全屏也要守住面板比例并居中，否则竖屏应用会被
+        // Qt 按比例缩回去、停在左上角。
+        const ratio = this._panelRatio();
+        const fitW = Math.min(area.w, Math.round(area.h * ratio));
+        const fitH = Math.round(fitW / ratio);
+        await this.agent.layout(this._physical({
+          x: Math.round(area.x + (area.w - fitW) / 2),
+          y: Math.round(area.y + (area.h - fitH) / 2),
+          w: fitW,
+          h: fitH,
+        }, area.sf)).catch(() => {});
       }
       return;
     }
@@ -537,11 +606,11 @@ class AppWindow {
     let w = maxW;
     let h = Math.round(w / ratio);
     if (h > maxH) { h = maxH; w = Math.round(h * ratio); }
-    await this.agent.layout({
+    await this.agent.layout(this._physical({
       x: Math.round(area.x + (area.w - w) / 2),
       y: Math.round(area.y + 60),
       w, h,
-    }).catch(() => {});
+    }, area.sf)).catch(() => {});
   }
 
   minimize() {

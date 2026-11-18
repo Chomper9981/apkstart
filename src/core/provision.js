@@ -13,7 +13,7 @@ const store = require('./store');
 const { t } = require('../i18n');
 const doctor = require('./doctor');
 const { download, downloadAny, downloadAnyParallel, downloadMulti, head, discardPartial } = require('./download');
-const { ZipArchive, ZipFile } = require('./zip');
+const { ZipArchive, ZipFile, resolveZipEntry } = require('./zip');
 const { Sources } = require('./sources');
 const { cmpVer } = require('./version');
 
@@ -270,8 +270,20 @@ class Provisioner {
     //  3) 全新安装（两处都没有）→ 落在运行时目录，因为用户数据目录可能是被
     //     重定向过的临时目录（CI 组装运行时就是这种情况，写歪会直接校验失败）。
     //  4) 运行时目录只读（MSIX 包内）→ 必须落到用户数据目录，否则 .img.xz 展不开。
+    //
+    // 另外（0.6.0 修复）：优先选「已经展开好的镜像」那一处。之前只要运行时目录里
+    // 有 system-images（哪怕只有 .img.xz）就选它，结果用户数据目录里明明有一份
+    // 3.1GB 可用的 system.img，却还每次去解压缩包 —— 压缩包一旦截断（0.5.9 就是
+    // 这样），解压必然失败，表现为「装完什么应用都打不开」。
+    // 现在：谁能直接用就用谁，都不完整时才选下载/解压的落点。
+    const expandedImgDir = (base) => path.join(base, `android-${sysApi}`, sysTag, sysAbi, 'system.img');
+    const hasExpanded = (base) => {
+      try { return fs.statSync(expandedImgDir(base)).size > 100 * 1024 * 1024; } catch (_) { return false; }
+    };
     let sysRoot;
     if (!rootWritable) sysRoot = dataImg;
+    else if (hasExpanded(rootImg)) sysRoot = rootImg;
+    else if (hasExpanded(dataImg)) sysRoot = dataImg;
     else if (fs.existsSync(rootImg)) sysRoot = rootImg;
     else if (fs.existsSync(dataImg)) sysRoot = dataImg;
     else sysRoot = rootImg;
@@ -674,11 +686,17 @@ class Provisioner {
 
     try {
       for (const name of zip.names()) {
-        if (name.endsWith('/')) {
-          fs.mkdirSync(path.join(destDir, name), { recursive: true });
+        // zip-slip 守卫（issue #2 P0-4）：运行时包来自网络，条目名不可信。
+        // 目录条目和文件条目都必须是 destDir 内的合法相对路径。
+        const target = resolveZipEntry(destDir, name);
+        if (!target) {
+          if (opts.onUnsafeEntry) opts.onUnsafeEntry(name);
           continue;
         }
-        const target = path.join(destDir, name);
+        if (name.endsWith('/')) {
+          fs.mkdirSync(target, { recursive: true });
+          continue;
+        }
         fs.mkdirSync(path.dirname(target), { recursive: true });
         const e = zip.entries.get(name);
         if (e.uncompSize > STREAM_THRESHOLD) {
@@ -702,11 +720,31 @@ class Provisioner {
   async _fetchText(url, limit = 2 * 1024 * 1024) {
     const { openStream } = require('./download');
     const res = await openStream(url);
-    return new Promise((resolve, reject) => {
+    // issue #2 P1-1：超限时 destroy() 既不发 'end'、错误又没被兜住时，
+    // 这个 Promise 永远不 settle，部署向导就永久卡在「正在解析索引」。
+    // 用一次性 settle 门闩 + 硬超时，任何路径都只结算一次。
+    return new Promise((resolve) => {
       let d = '';
-      res.on('data', (c) => { d += c; if (d.length > limit) res.destroy(); });
-      res.on('end', () => resolve(d));
-      res.on('error', () => resolve(d));
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(d);
+      };
+      const timer = setTimeout(() => { try { res.destroy(); } catch (_) {} finish(); }, 30000);
+      res.on('data', (c) => {
+        if (done) return;
+        d += c;
+        if (d.length > limit) {
+          d = '';                       // 超出上限的内容不可用，别把半截索引当完整
+          try { res.destroy(); } catch (_) {}
+          finish();
+        }
+      });
+      res.on('end', finish);
+      res.on('close', finish);
+      res.on('error', finish);
     });
   }
 
@@ -860,7 +898,18 @@ class Provisioner {
             // Electron 的 Node 20 不支持 require(ESM) 会抛错；而 exports 又不允许
             // 直接写 '@napi-rs/lzma/index.js'，所以用 require.resolve 定位目录后按文件路径引。
             const path0 = require('path');
-            const lzmaDir = path0.dirname(require.resolve('@napi-rs/lzma'));
+            let lzmaDir;
+            try {
+              lzmaDir = path0.dirname(require.resolve('@napi-rs/lzma'));
+            } catch (_) {
+              // 打包时漏带 node_modules/@napi-rs 就会走到这里。以前直接抛
+              // "Cannot find module '@napi-rs/lzma'"+一长串 require stack，
+              // 用户完全看不懂，只会觉得「装完什么应用都打不开」。
+              // 明确告诉他这是安装包不完整，而不是他的电脑有问题。
+              const e2 = new Error(t('安装包不完整：缺少解压组件 @napi-rs/lzma，系统镜像无法展开。请重新下载完整版，或改用商店版。'));
+              e2.code = 'LZMA_MISSING';
+              throw e2;
+            }
             const { xz } = require(path0.join(lzmaDir, 'index.js'));
             const webIn = Readable.toWeb(fs.createReadStream(j.src));
             const webOut = xz.decompressStream(webIn);

@@ -10,6 +10,17 @@ const path = require('path');
 const crypto = require('crypto');
 const { t } = require('../i18n');
 const store = require('./store');
+const { autoRotateSetting } = require('./orientation');
+
+/**
+ * 镜像内「自动旋转」开关要写进 guest 的值（'1' 开 / '0' 关）。
+ * 面板方向不由它决定 —— setOrientation / resetDisplayOverrides 里紧跟的
+ * `wm user-rotation lock 0` + `wm set-ignore-orientation-request` 才是方向权威。
+ * 这里只是让系统设置里的开关显示为「开」，满足应用读取该 setting 的期望。
+ */
+function guestAutoRotate() {
+  try { return autoRotateSetting(store.getSettings()); } catch (_) { return '1'; }
+}
 
 /**
  * 平板排版的逻辑密度。
@@ -25,13 +36,16 @@ function tabletDensity() {
   }
 }
 
+/**
+ * 系统里可能存在的 adb 位置。**故意只列 Android SDK 与常见手动安装目录**：
+ * 第三方模拟器自带的 adb（MuMu / 雷电 / 蓝叠）不在这里 —— 用它们的 adb 会连带
+ * 继承别人的 server 状态（端口、授权、offline 抖动），与「独立运行」冲突。
+ * 自己那份 adb 在运行时目录里，优先级永远最高（见 engine.adbPath）。
+ */
 const COMMON_ADB_PATHS = [
   path.join(process.env.LOCALAPPDATA || '', 'Android', 'Sdk', 'platform-tools', 'adb.exe'),
-  'C:\\Android\\platform-tools\\adb.exe',
-  'C:\\adb\\adb.exe',
-  'C:\\LDPlayer\\LDPlayer9\\adb.exe',
-  'C:\\Program Files\\Netease\\MuMuPlayer-12.0\\shell\\adb.exe',
-  'C:\\Program Files\\BlueStacks_nxt\\HD-Adb.exe',
+  'C:/Android/platform-tools/adb.exe',
+  'C:/adb/adb.exe',
 ];
 
 /**
@@ -91,6 +105,36 @@ function friendlyLaunchError(raw, pkg) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 解析 `adb devices` 里某个 serial 的 state 列。
+ * 关键：unauthorized 的设备在 `get-state` 里也会回报 'device'，只有 devices 列表的
+ * state 列能区分 authorized / unauthorized / offline —— 开机探测据此快速自愈。
+ */
+function parseDeviceState(text, serial) {
+  const lines = String(text || '').split(/\r?\n/).slice(1);
+  for (const line of lines) {
+    const m = /^(\S+)\s+(unauthorized|offline|recovery|sideload|no\s+permissions|device)\b/i.exec(line.trim());
+    if (!m) continue;
+    if (serial && m[1] !== serial) continue;
+    const st = m[2].toLowerCase().replace(/\s+/g, '');
+    if (st === 'device') return 'device';
+    if (st === 'unauthorized' || st === 'nopermissions') return 'unauthorized';
+    return st; // offline / recovery / sideload
+  }
+  return 'no-device';
+}
+
+/** 从「允许 USB 调试」对话框未确认导致的 shell 报错里识别出 unauthorized */
+function isUnauthorizedError(raw) {
+  return /\bunauthorized\b|no permissions|confirm.*(allow|debug)/i.test(String(raw || ''));
+}
+
+/** 从 `pm path <pkg>` 的输出里取出每个 APK 的真实路径 */
+function parsePmPaths(text) {
+  return String(text || '').split(/\r?\n/).map((l) => l.trim())
+    .filter((l) => /^package:/.test(l)).map((l) => l.slice(8).trim()).filter(Boolean);
+}
 
 /** 已解析过的启动入口（adbPath|pkg → activity），10 分钟有效 */
 const LAUNCHER_CACHE = new Map();
@@ -206,7 +250,18 @@ class AdbClient {
   }
 
   _adbEnv() {
-    return { ...process.env, ANDROID_ADB_SERVER_PORT: process.env.ANDROID_ADB_SERVER_PORT || '5044' };
+    const env = { ...process.env, ANDROID_ADB_SERVER_PORT: process.env.ANDROID_ADB_SERVER_PORT || '5044' };
+    // Play 商店镜像会强制 ADB 授权：host 的 adb server 与 guest 的 adbd 必须用同一把
+    // adbkey。官方做法是 adb/emulator 共用 %USERPROFILE%\.android\adbkey{,.pub}，
+    // emulator 启动时把 adbkey.pub 烤进 guest 的 /data/misc/adb/adb_keys。
+    // 显式告诉 adb server 去哪里找公钥：某些环境 ANDROID_SDK_HOME / 绿色版运行时
+    // 会让 adb 在别处找 key，于是每次冷启动都弹「允许 USB 调试」→ device unauthorized。
+    if (!env.ADB_VENDOR_KEYS) {
+      const home = process.env.USERPROFILE || process.env.HOME || '';
+      const keyDir = path.join(home, '.android');
+      try { if (home && fs.existsSync(keyDir)) env.ADB_VENDOR_KEYS = keyDir; } catch (_) { /* ignore */ }
+    }
+    return env;
   }
 
   exec(args, { timeout = 30000, withSerial = true, binary = false } = {}) {
@@ -361,6 +416,20 @@ class AdbClient {
     }
   }
 
+  /**
+   * 读取本 serial 在 `adb devices` 里的真实状态：device / unauthorized / offline / no-device。
+   * isOnline() 用的 get-state 无法区分 authorized 与 unauthorized（两者都是 'device'），
+   * 开机探测靠这个方法来识别「授权对话框卡住」并快速自愈。
+   */
+  async deviceState() {
+    try {
+      const { stdout } = await this.exec(['devices'], { withSerial: false, timeout: 8000 });
+      return parseDeviceState(stdout, this.serial);
+    } catch (_) {
+      return 'no-device';
+    }
+  }
+
   async devices() {
     const { stdout } = await this.exec(['devices', '-l'], { withSerial: false });
     return stdout.split('\n').slice(1)
@@ -485,9 +554,24 @@ class AdbClient {
     }
   }
 
+  /**
+   * 是否真的装好了 —— 不轻信 PackageManager 的一句话。
+   *
+   * 快照与数据分区不一致时，`pm path` 会因 packages.xml 里还留着记录而返回
+   * `package:/data/app/.../base.apk`（installed=true），但那个 APK 文件其实已经被
+   * 回滚掉了。继续 `am start` 只会失败。所以用 `test -f/-s` 逐个核对 pm 报出来的
+   * 路径，文件不在（或空文件）就判定为「未真正安装」，交给上层自动重装。
+   *
+   * @returns {Promise<boolean>}
+   */
   async isInstalled(pkg) {
     const out = await this.shell(`pm path ${pkg}`);
-    return /package:/.test(out);
+    const paths = parsePmPaths(out);
+    if (!paths.length) return false;
+    // 分片 APK 全部要在；任一片丢了都启动不了。合并成一条 shell，省一次 adb 往返。
+    const checks = paths.map((p) => `[ -s "${p}" ]`).join(' && ');
+    const probe = await this.shell(`${checks} && echo __APKSTART_PRESENT__`, { timeout: 10000 }).catch(() => '');
+    return /__APKSTART_PRESENT__/.test(String(probe));
   }
 
   async listPackages() {
@@ -734,6 +818,8 @@ class AdbClient {
   /** 清除应用数据 */
   async clearData(pkg) {
     await this.shell(`pm clear ${pkg}`);
+    // 数据清掉权限也一起掉了，必须让下次启动重新授，不能命中 permGranted 缓存
+    try { store.upsertApp({ package: pkg, permGranted: false }); } catch (_) { /* ignore */ }
   }
 
   /** 导出应用数据（Windows/调试版可用 run-as；否则走 adb backup 兜底） */
@@ -754,8 +840,18 @@ class AdbClient {
    * 把应用申请的运行时权限一次性授掉。
    * 不授会有两个后果：① 首次启动弹系统授权框，用户看到的是「应用没打开」；
    * ② 清过数据（pm clear）之后权限会掉，应用起来就卡在授权页。
+   *
+   * 性能：`dumpsys package` 在 guest 里要起一次 app_process（实测 1~3s），
+   * 每条 `pm grant` / `cmd appops set` 又是各起一次。红果这种十几个权限的应用，
+   * 光这一段就吃掉 20 秒以上（日志里 permissions granted 从 +18s 到 +42s）。
+   * 权限授过之后状态是持久的，除非重装或 pm clear 才会掉，
+   * 所以授完在 apps.json 里记一笔，后续启动直接跳过；清数据/重装时把标记清掉。
    */
   async grantRuntimePermissions(pkg) {
+    try {
+      const rec = store.getApp(pkg);
+      if (rec && rec.permGranted === true) return [];
+    } catch (_) { /* 读不到记录就当没授过 */ }
     let dump = '';
     try {
       dump = await this.shell(`dumpsys package ${pkg}`, { timeout: 20000 });
@@ -784,6 +880,8 @@ class AdbClient {
       await this.shell(cmds.join(' ; '), { timeout: 20000 }).catch(() => '');
       granted.push(...denied);
     }
+    // 只有真的跑完命令才记标记：中途失败下次还会重试，不会留下「以为授过」的假状态
+    try { store.upsertApp({ package: pkg, permGranted: true }); } catch (_) { /* ignore */ }
     return granted;
   }
 
@@ -805,6 +903,10 @@ class AdbClient {
       'settings put global transition_animation_scale 0',
       'settings put global animator_duration_scale 0',
       'settings put system screen_off_timeout 2147483647',
+      // 大屏任务栏：平板密度下 Pixel Launcher 会在底部常驻一条 Taskbar，
+      // 盖住应用内容、按键挤在左下角（用户反馈的「按键错位」）。
+      // 见 disableLauncherTaskbar()：这里每次启动都补一刀，幂等且只多一次往返。
+      'settings put global enable_taskbar 0',
       // 联网验证：安卓默认拿 connectivitycheck.gstatic.com 判断「是否真能上网」，
       // 国内连不上它，系统就一直给网络打「!」标记（已连接但无法访问互联网），
       // 部分应用据此自我判定离线、拒绝加载内容。换成国内返回 204 的端点。
@@ -850,8 +952,11 @@ class AdbClient {
    */
   async setOrientation(landscape) {
     try {
-      // 自动旋转必须关掉（否则传感器会乱转）。
-      await this.shell('settings put system accelerometer_rotation 0; wm size reset', { timeout: 15000 });
+      // 自动旋转开关默认打开（0.5.9）：写 guest 的 accelerometer_rotation=1，
+      // 让系统设置里那个开关是「开」的。方向本身由下面的 wm user-rotation lock 0
+      // + set-ignore-orientation-request 决定，不受传感器影响，所以不会乱转。
+      // 用户可在设置 →「镜像自动旋转」关掉，回到旧的锁定 0 行为。
+      await this.shell(`settings put system accelerometer_rotation ${guestAutoRotate()}; wm size reset`, { timeout: 15000 });
       // 方向锁 **0**（不是 1）。物理面板的方向已经由 hw.lcd.width/height 决定
       // （见 doctor.lcdFor），这里再锁 1 等于把横面板又转成竖逻辑空间，
       // 结果就是画面躺倒 90° —— 这正是「横屏没弄好」的直接原因。
@@ -874,6 +979,72 @@ class AdbClient {
     }
   }
 
+  /**
+   * 关掉大屏任务栏（Android 12L+ 的 Taskbar）。
+   *
+   * 为什么需要：平板排版把 density 压到 190dpi，720 宽 ⇒ sw606dp，
+   * 越过了 Android 的 600dp 大屏断点。Pixel Launcher 于是在屏幕底部常驻
+   * 一条 NAVIGATION_BAR_PANEL 类型的任务栏：半透明、盖住应用内容，
+   * 返回/主页/最近三个键被挤到左下角 —— 就是用户截图里的「按键错位」。
+   *
+   * 它不是系统导航栏（gestural overlay 那个），所以 policy_control immersive
+   * 关不掉它，只能关 global enable_taskbar；而且 Launcher 只在启动时读一次，
+   * 已经起来了就得让它重启才生效。两个启动器包名都点一遍，覆盖 Play 版和 AOSP 版。
+   */
+  async disableLauncherTaskbar() {
+    try {
+      await this.shell('settings put global enable_taskbar 0', { timeout: 10000 });
+      // grep -c 命中 0 行时退出码是 1，补 || true 免得被当成命令失败
+      const out = await this.shell(
+        'dumpsys window windows | grep -c "Window #.*Taskbar" || true',
+        { timeout: 12000 },
+      ).catch(() => '0');
+      const alive = parseInt(String(out).trim(), 10) || 0;
+      if (alive > 0) {
+        await this.shell(
+          'am force-stop com.google.android.apps.nexuslauncher; am force-stop com.android.launcher3',
+          { timeout: 12000 },
+        ).catch(() => '');
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * 等应用真的画出第一帧。
+   *
+   * 「窗口接上了」和「用户能看到画面」是两件事：Application 进程起来后，
+   * Android 12+ 会先挂一屏系统 Splash（应用图标 + 白底），Activity 完成首帧
+   * 才会把它撤掉。开机动画如果在这一步之前就淡出，用户看到的就是一张白底图，
+   * 以为卡死了 —— 所以启动动画要守到系统 Splash 窗口消失再收。
+   *
+   * 判定：窗口列表里不再有 "Splash Screen" 记录，且焦点落在目标包上。
+   * 超时返回 false，调用方照常收动画（不能因为判定失败把用户永远关在动画里）。
+   */
+  async waitForAppFirstFrame(pkg, { timeoutMs = 12000, intervalMs = 350 } = {}) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      // 必须用 `dumpsys window`（WINDOW MANAGER 全量），不能用
+      // `dumpsys window windows`：后者只列窗口，**没有 mCurrentFocus 这一行**，
+      // focusOnApp 于是永远是 false，判定必然超时 —— 表现就是应用明明已经画出
+      // 画面，开机动画还要再钉满 12 秒才肯淡出。
+      const out = await this.shell(
+        'dumpsys window | grep -E "Splash Screen|mCurrentFocus" | head -8',
+        { timeout: 8000 },
+      ).catch(() => '');
+      const s = String(out);
+      if (s.trim()) {
+        const splashAlive = /Splash Screen/.test(s);
+        const focusOnApp = s.indexOf(pkg) >= 0;
+        if (!splashAlive && focusOnApp) return true;
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return false;
+  }
+
   /** 启动时清掉旧版本残留的 wm size / density 覆盖（持久化在 /data，会一直躺倒） */
   async resetDisplayOverrides(landscape = false) {
     try {
@@ -884,10 +1055,13 @@ class AdbClient {
       // 左上角一小块、右边一大片空白，也就是用户说的「墨读没有填满窗口」。
       // 现在在这里连同 size 一起重设，启动路径上不再有中途改密度。
       await this.shell(`wm size reset; wm density ${tabletDensity()}`, { timeout: 15000 });
-      await this.shell('settings put system accelerometer_rotation 0', { timeout: 15000 });
+      await this.shell(`settings put system accelerometer_rotation ${guestAutoRotate()}`, { timeout: 15000 });
       // 与 setOrientation 保持一致：面板方向说了算，逻辑方向锁 0。
       await this.shell('wm user-rotation lock 0', { timeout: 15000 });
       await this.shell(`wm set-ignore-orientation-request ${landscape ? 'true' : 'false'}`, { timeout: 15000 });
+      // 平板密度一设，Launcher 的任务栏就跟着起来（sw>=600dp）。它只在启动时
+      // 读一次 enable_taskbar，所以这里除了写开关，还要在它已经起来时重启一次。
+      await this.disableLauncherTaskbar();
       return true;
     } catch (_) {
       return false;
@@ -1013,5 +1187,5 @@ class AdbClient {
 
 module.exports = {
   AdbClient, AdbError, parseStatList, friendlyInstallError, friendlyLaunchError,
-  componentArg, parseResolvedActivity,
+  componentArg, parseResolvedActivity, parseDeviceState, isUnauthorizedError, parsePmPaths,
 };

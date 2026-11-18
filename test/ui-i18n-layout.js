@@ -215,6 +215,24 @@ async function run() {
             await sleep(120);
             await capture(win, path.join(OUT, `${lang}-${c.name}-${DPR}x-settings-p${page + 1}.png`));
           }
+          // The settings dialog is split into categories (left nav): only one is visible at a time,
+          // so probe each of them, not just the one that happens to be open.
+          const cats = await win.webContents.executeJavaScript(
+            "Array.from(document.querySelectorAll('#setNav .set-nav-item')).map((b) => b.dataset.cat)",
+          );
+          for (const cat of cats) {
+            await win.webContents.executeJavaScript(`(() => {
+              const b = document.querySelector('#setNav .set-nav-item[data-cat="${cat}"]');
+              if (b) b.click();
+              const body = document.querySelector('#settingsMask .modal-body');
+              if (body) body.scrollTop = 0;
+            })()`);
+            await sleep(200);
+            const catProblems = await win.webContents.executeJavaScript(PROBE);
+            await capture(win, path.join(OUT, `${lang}-${c.name}-${DPR}x-settings-cat-${cat}.png`));
+            report.push({ lang, case: c.name, dpr: DPR, view: `settings/${cat}`, problems: catProblems });
+            log(lang, `${c.name} ${DPR}x settings/${cat}`, catProblems);
+          }
         }
       }
       win.destroy();
