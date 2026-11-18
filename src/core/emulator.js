@@ -1218,6 +1218,11 @@ class EmulatorEngine {
     // 之前把两者的余量取最小值，结果「数据目录已经挪到 D 盘、C 盘只剩 400MB」
     // 会被误判成磁盘不足 —— 挪盘等于白挪。
     const avdHome = this.provisioner.paths().avdHome;
+    // 机械硬盘上冷启动实测要 400 秒左右（NVMe 约 60 秒），240 秒的开机超时会把每个方案都
+    // 判成「超时」然后一路降级到必崩的无加速方案。先异步查一下 AVD / 系统镜像所在盘的类型
+    // （结果按盘符缓存），等到真的要计时时再用。
+    const slowDiskP = Promise.all([avdHome, loc.root].map((d) => doctor.diskMediaType(d).catch(() => '')))
+      .then((types) => types.includes('HDD')).catch(() => false);
     const avdFreeMB = doctor.freeDiskMB(avdHome);
     const diskMB = doctor.freeDiskMB(loc.root);
     const needMB = 2500;
@@ -1395,7 +1400,13 @@ class EmulatorEngine {
       }
 
       const started = Date.now();
-      const timeout = plan.bootTimeoutMs || 240000;
+      const slowDisk = await slowDiskP;
+      const timeout = Math.round((plan.bootTimeoutMs || 240000) * (slowDisk ? 2.5 : 1));
+      if (slowDisk && !this._slowDiskNoted) {
+        this._slowDiskNoted = true;
+        this.log(`slow disk (HDD) detected for avd/runtime: boot timeout x2.5 = ${timeout}ms`);
+        onLog(t('安卓数据或运行时在机械硬盘上，开机会明显变慢，已放宽开机超时。建议把它们放到固态硬盘。'));
+      }
       let ok = false;
       let fatal = false;
       let sawBooting = false;

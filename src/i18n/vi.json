@@ -470,6 +470,7 @@
   "安卓数据分区比配置的小": "Phân vùng dữ liệu Android nhỏ hơn cấu hình",
   "安卓数据分区（应用与游戏装这里）": "Phân vùng dữ liệu Android (nơi cài ứng dụng và game)",
   "安卓数据已重置": "Đã đặt lại dữ liệu Android",
+  "安卓数据或运行时在机械硬盘上，开机会明显变慢，已放宽开机超时。建议把它们放到固态硬盘。": "Dữ liệu Android hoặc runtime nằm trên ổ cứng cơ (HDD) nên khởi động chậm hơn nhiều; đã nới thời gian chờ khởi động. Nên chuyển chúng sang ổ SSD.",
   "安卓数据目录": "Thư mục dữ liệu Android",
   "安卓数据目录已更新": "Đã cập nhật thư mục dữ liệu Android",
   "安卓数据目录（应用、游戏与快速启动快照）": "Thư mục dữ liệu Android (ứng dụng, game và snapshot khởi động nhanh)",

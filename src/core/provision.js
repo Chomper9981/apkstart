@@ -813,7 +813,14 @@ class Provisioner {
         return cached.version;
       }
       // eslint-disable-next-line no-await-in-loop
-      const r = await run(c, ['-version'], { timeout: 20000 });
+      let r = await run(c, ['-version'], { timeout: 20000 });
+      // 超时被杀（不是 emulator 自己报错退出）：机械硬盘上刚展开完几个 GB 的镜像时，
+      // emulator.exe 冷加载就可能超过 20 秒。这时判成「没有 emulator」只会给用户一句
+      // 误导的「运行时组件尚未部署完成」，放宽超时再试一次。
+      if (!/Android emulator version/i.test(`${r.stdout}${r.stderr}`) && r.error && r.error.killed) {
+        // eslint-disable-next-line no-await-in-loop
+        r = await run(c, ['-version'], { timeout: 90000 });
+      }
       const text = `${r.stdout}${r.stderr}`;
       const m = /Android emulator version\s+([\d.]+)/i.exec(text);
       if (m) {
